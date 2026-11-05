@@ -59,18 +59,62 @@ class BackgroundJobOutbox(Base):
     lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_rq_job_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    execution_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    execution_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    execution_lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    execution_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_execution_error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     last_error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending','publishing','enqueued','dead')",
+            "status IN ('pending','publishing','enqueued','running','completed','dead')",
             name="ck_background_job_outbox_status",
         ),
         CheckConstraint("attempts >= 0", name="ck_background_job_outbox_attempts"),
+        CheckConstraint("execution_attempts >= 0", name="ck_background_job_outbox_execution_attempts"),
+        CheckConstraint("execution_generation >= 0", name="ck_background_job_outbox_execution_generation"),
         CheckConstraint("job_timeout_seconds >= 1", name="ck_background_job_outbox_timeout"),
         Index("ix_background_job_outbox_status_available", "status", "available_at"),
         Index("ix_background_job_outbox_lease", "status", "lease_expires_at"),
+        Index("ix_background_job_outbox_execution_lease", "status", "execution_lease_expires_at"),
+    )
+
+
+class BackgroundJobExecutionAttempt(Base):
+    """Durable lifecycle history for each logical background-job execution attempt."""
+    __tablename__ = "background_job_execution_attempts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    outbox_id: Mapped[str] = mapped_column(
+        ForeignKey("background_job_outbox.id", ondelete="CASCADE"), nullable=False
+    )
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    rq_job_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    worker_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    queue_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    result_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    __table_args__ = (
+        UniqueConstraint(
+            "outbox_id", "generation", "attempt_number",
+            name="uq_background_job_execution_generation_attempt",
+        ),
+        CheckConstraint("generation >= 0 AND attempt_number >= 1", name="ck_background_job_execution_attempt_number"),
+        CheckConstraint(
+            "status IN ('running','completed','failed','abandoned')",
+            name="ck_background_job_execution_status",
+        ),
+        Index("ix_background_job_execution_outbox_started", "outbox_id", "started_at"),
+        Index("ix_background_job_execution_status_started", "status", "started_at"),
     )
 
 

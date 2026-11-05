@@ -5,6 +5,7 @@ how quickly a committed job request is delivered, not whether it is recorded.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Callable
 from datetime import timedelta
@@ -54,7 +55,7 @@ def enqueue_report_analysis(db: Session, report_id: str, revision: int) -> Backg
         job_id=job_id,
         function_path="app.worker.process_report",
         task_args=args,
-        queue_name="cignal",
+        queue_name="cignal-priority",
         job_timeout_seconds=300,
         result_ttl_seconds=3600,
         status="pending",
@@ -126,7 +127,7 @@ def enqueue_event_replay(db: Session, replay_id: str) -> BackgroundJobOutbox:
     row = BackgroundJobOutbox(
         id=str(uuid4()), job_id=job_id,
         function_path="app.worker.replay_event_history", task_args=args,
-        queue_name="cignal", job_timeout_seconds=1800, result_ttl_seconds=86400,
+        queue_name="cignal-bulk", job_timeout_seconds=1800, result_ttl_seconds=86400,
         status="pending", attempts=0, available_at=utcnow(),
         created_at=utcnow(), updated_at=utcnow(),
     )
@@ -140,6 +141,7 @@ def _claim_batch(session: Session, *, batch_size: int, lease_seconds: int, token
         and_(BackgroundJobOutbox.status == "pending", BackgroundJobOutbox.available_at <= now),
         and_(
             BackgroundJobOutbox.status == "publishing",
+            BackgroundJobOutbox.last_rq_job_id.is_(None),
             or_(
                 BackgroundJobOutbox.lease_expires_at.is_(None),
                 BackgroundJobOutbox.lease_expires_at <= now,
@@ -158,12 +160,17 @@ def _claim_batch(session: Session, *, batch_size: int, lease_seconds: int, token
     for row in rows:
         row.status = "publishing"
         row.attempts = int(row.attempts or 0) + 1
+        rq_job_id = "cignal-delivery-" + hashlib.sha256(
+            f"{row.job_id}:{row.attempts}".encode()
+        ).hexdigest()[:48]
+        row.last_rq_job_id = rq_job_id
         row.lease_token = token
         row.lease_expires_at = now + timedelta(seconds=max(15, int(lease_seconds)))
         row.updated_at = now
         claimed.append({
             "id": row.id,
             "job_id": row.job_id,
+            "rq_job_id": rq_job_id,
             "function_path": row.function_path,
             "task_args": list(row.task_args or []),
             "queue_name": row.queue_name,
@@ -175,17 +182,38 @@ def _claim_batch(session: Session, *, batch_size: int, lease_seconds: int, token
     return claimed
 
 
-def _mark_enqueued(session_factory: Callable, job_id: str, token: str) -> bool:
+def _mark_enqueued(
+    session_factory: Callable,
+    job_id: str,
+    token: str,
+    rq_job_id: str,
+) -> bool:
     with session_factory() as session:
         row = session.query(BackgroundJobOutbox).filter_by(job_id=job_id).one_or_none()
-        if row is None or row.status != "publishing" or row.lease_token != token:
+        if row is None or row.status not in {"publishing", "running", "completed"}:
             session.rollback()
             return False
-        row.status = "enqueued"
+        # A very fast worker can complete before the relay receives its enqueue
+        # acknowledgement. Completion clears the publishing lease, so match the
+        # persisted delivery ID as the second fencing condition for that race.
+        lease_matches = row.lease_token == token
+        completed_delivery_matches = (
+            row.status in {"running", "completed"}
+            and bool(rq_job_id)
+            and row.last_rq_job_id == rq_job_id
+        )
+        if not (lease_matches or completed_delivery_matches):
+            session.rollback()
+            return False
+        # A fast worker may claim or complete before the relay receives its enqueue
+        # acknowledgement. Record delivery time without regressing its state.
+        if row.status == "publishing":
+            row.status = "enqueued"
         row.enqueued_at = utcnow()
         row.lease_token = None
         row.lease_expires_at = None
-        row.last_error_code = None
+        if row.status == "completed":
+            row.last_error_code = None
         row.updated_at = utcnow()
         session.commit()
         return True
@@ -216,6 +244,7 @@ def _mark_failed(
         else:
             delay = min(3600, 5 * (2 ** min(max(0, attempts - 1), 9)))
             row.status = "pending"
+            row.last_rq_job_id = None  # retire a failed enqueue delivery before retry
             row.available_at = now + timedelta(seconds=delay)
             outcome = "retried"
         session.commit()
@@ -243,28 +272,40 @@ def dispatch_pending_jobs(
         try:
             if item["function_path"] not in _ALLOWED_FUNCTIONS:
                 raise ValueError("Unsupported durable background function")
-            existing = queue.fetch_job(item["job_id"])
+            target_queue = (
+                queue.get(item["queue_name"]) if isinstance(queue, dict) else queue
+            )
+            if target_queue is None:
+                raise ValueError(f"Configured RQ queue is unavailable: {item['queue_name']}")
+            existing = target_queue.fetch_job(item["rq_job_id"])
             if existing is not None:
-                state = existing.get_status(refresh=True)
+                raw_state = existing.get_status(refresh=True)
+                state = str(getattr(raw_state, "value", raw_state)).lower().split(".")[-1]
                 if state not in _ACTIVE_RQ_STATES:
                     existing.delete()
                     existing = None
             if existing is None:
                 try:
-                    queue.enqueue(
-                        item["function_path"],
-                        *item["task_args"],
-                        job_id=item["job_id"],
+                    target_queue.enqueue(
+                        "app.worker.execute_outbox_job",
+                        item["id"],
+                        item["rq_job_id"],
+                        job_id=item["rq_job_id"],
                         job_timeout=item["job_timeout_seconds"],
                         result_ttl=item["result_ttl_seconds"],
                     )
                 except Exception:
-                    # A competing scheduler may have enqueued the same deterministic
-                    # RQ ID after our fetch. Treat an active/finished winner as success.
-                    raced = queue.fetch_job(item["job_id"])
-                    if raced is None or raced.get_status(refresh=True) not in _ACTIVE_RQ_STATES:
+                    # Redis may have accepted the write before the client lost its response.
+                    # Re-check the same delivery id before releasing the database lease.
+                    raced = target_queue.fetch_job(item["rq_job_id"])
+                    if raced is not None:
+                        raw_state = raced.get_status(refresh=True)
+                        raced_state = str(getattr(raw_state, "value", raw_state)).lower().split(".")[-1]
+                    else:
+                        raced_state = "missing"
+                    if raced_state not in _ACTIVE_RQ_STATES:
                         raise
-            marked = _mark_enqueued(factory, item["job_id"], token)
+            marked = _mark_enqueued(factory, item["job_id"], token, item["rq_job_id"])
             if marked:
                 result["enqueued"] += 1
             else:
@@ -287,14 +328,24 @@ def dispatch_pending_jobs(
 
 
 def summarize_outbox(session: Session, *, recent_limit: int = 25) -> dict:
-    """Return bounded operational metadata without exposing job arguments."""
-    counts = {status: 0 for status in ("pending", "publishing", "enqueued", "dead")}
-    for status, count in (
-        session.query(BackgroundJobOutbox.status, func.count())
-        .group_by(BackgroundJobOutbox.status)
+    """Return bounded delivery/execution health without exposing task arguments."""
+    statuses = ("pending", "publishing", "enqueued", "running", "completed", "dead")
+    counts = {status: 0 for status in statuses}
+    queue_counts: dict[str, dict[str, int]] = {}
+    for queue_name, status, count in (
+        session.query(
+            BackgroundJobOutbox.queue_name,
+            BackgroundJobOutbox.status,
+            func.count(),
+        )
+        .group_by(BackgroundJobOutbox.queue_name, BackgroundJobOutbox.status)
         .all()
     ):
-        counts[str(status)] = int(count)
+        queue_counts.setdefault(str(queue_name), {name: 0 for name in statuses})
+        queue_counts[str(queue_name)][str(status)] = int(count)
+        if str(status) in counts:
+            counts[str(status)] += int(count)
+
     rows = (
         session.query(BackgroundJobOutbox)
         .order_by(BackgroundJobOutbox.created_at.desc())
@@ -303,15 +354,23 @@ def summarize_outbox(session: Session, *, recent_limit: int = 25) -> dict:
     )
     return {
         "counts": counts,
+        "queues": queue_counts,
         "recent": [
             {
                 "job_id": row.job_id,
+                "rq_job_id": row.last_rq_job_id,
                 "function_path": row.function_path,
+                "queue_name": row.queue_name,
                 "status": row.status,
-                "attempts": row.attempts,
+                "dispatch_attempts": row.attempts,
+                "execution_attempts": row.execution_attempts,
+                "execution_generation": row.execution_generation,
                 "available_at": row.available_at.isoformat() if row.available_at else None,
                 "enqueued_at": row.enqueued_at.isoformat() if row.enqueued_at else None,
+                "last_started_at": row.last_started_at.isoformat() if row.last_started_at else None,
+                "completed_at": row.completed_at.isoformat() if row.completed_at else None,
                 "last_error_code": row.last_error_code,
+                "last_execution_error_code": row.last_execution_error_code,
             }
             for row in rows
         ],

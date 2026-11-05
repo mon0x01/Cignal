@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     continuous_event_discovery_quiet_seconds: int = 120
     continuous_event_discovery_window_hours: int = 72
     continuous_event_discovery_max_reports: int = 300
+    background_job_max_execution_attempts: int = 8
+    background_job_dispatch_max_attempts: int = 12
+    background_job_lease_grace_seconds: int = 120
+    background_job_reconcile_grace_seconds: int = 120
     retention_enabled: bool = True
     evidence_integrity_audit_enabled: bool = True
     mfa_required: bool = True

@@ -176,6 +176,13 @@ The scheduler runs ingestion periodically, performs the configured retention tas
 
 See [Operations](docs/OPERATIONS.md), [Security](docs/SECURITY.md), [Evidence integrity](docs/EVIDENCE_INTEGRITY.md), [Incident activity](docs/INCIDENT_ACTIVITY.md), [Integrations](docs/INTEGRATIONS.md), [Architecture](docs/ARCHITECTURE.md), [API](docs/API.md), [Testing](docs/TESTING.md) and [Known limitations](docs/LIMITATIONS.md).
 
+## Distributed background-job reliability
+
+Cignal persists outbox requests in PostgreSQL, records per-execution attempt history,
+fences duplicate workers, recovers expired worker leases, and separates priority report
+analysis from bulk historical replay. Delivery is at-least-once; domain operations still
+need idempotency guards. See `docs/DISTRIBUTED_JOB_RELIABILITY_V1.md`.
+
 ## License and data policy
 
 The source code in this project is provided under the MIT License. Each external dataset/API has its own terms, rate limits, attribution and permitted-use rules. The operator is responsible for reviewing current provider terms before enabling an integration or exposing the service to a public audience. Do not ingest private social data, bypass platform restrictions, or use feeds you are not authorised to process.

@@ -4,8 +4,10 @@ import logging
 import math
 import os
 import shutil
+import socket
 import subprocess
 import tarfile
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from secrets import token_hex
@@ -31,7 +33,7 @@ from app.db.models import (
     RefreshToken,
     Report,
 )
-from app.db.session import SessionLocal, initialize_database
+from app.db.session import SessionLocal, engine, initialize_database
 from app.intelligence.correlation import rank_duplicate_candidates
 from app.intelligence.pipeline import analyze_multimodal_report
 from app.services.events import enqueue_job, publish_event
@@ -727,11 +729,25 @@ def discover_event_hypotheses(run_id: str, parameters: dict | None = None) -> di
 
 
 def run_worker() -> None:
+    """Run only the configured workload lanes; RQ handles warm SIGTERM shutdown."""
     initialize_database()
     connection = Redis.from_url(settings.redis_url)
-    queue = Queue("cignal", connection=connection)
-    logger.info("Cignal background worker listening on queue 'cignal'")
-    Worker([queue], connection=connection).work(with_scheduler=True)
+    queue_names = [
+        item.strip()
+        for item in os.environ.get("CIGNAL_WORKER_QUEUES", "cignal-priority,cignal").split(",")
+        if item.strip()
+    ]
+    if not queue_names:
+        raise RuntimeError("CIGNAL_WORKER_QUEUES must contain at least one queue")
+    queues = [Queue(name, connection=connection) for name in queue_names]
+    logger.info(
+        "Cignal worker starting lanes=%s hostname=%s pid=%s",
+        queue_names, socket.gethostname(), os.getpid(),
+    )
+    # Cignal owns scheduling/retries in PostgreSQL. RQ's embedded scheduler is disabled.
+    # RQ's default signal handlers perform a warm shutdown on SIGTERM; Compose gives
+    # the worker enough grace to finish the longest supported task timeout.
+    Worker(queues, connection=connection).work(with_scheduler=False)
 
 
 def apply_retention_policy() -> dict:
@@ -1263,5 +1279,136 @@ def replay_acquisition_observation(observation_id: str) -> dict:
         observation.last_error_code = None if job else "queue_unavailable"
         db.commit()
         return {"ok": job is not None, "report_id": report.id, "job_id": job.id if job else None}
+    finally:
+        db.close()
+
+
+
+@contextmanager
+def _outbox_execution_lock(outbox_id: str):
+    """Fence duplicate executions across processes using a PostgreSQL session lock."""
+    if engine.dialect.name != "postgresql":
+        yield True
+        return
+    lock_key = int.from_bytes(
+        hashlib.sha256(str(outbox_id).encode("utf-8")).digest()[:8],
+        byteorder="big",
+        signed=True,
+    )
+    connection = engine.connect()
+    acquired = False
+    try:
+        acquired = bool(
+            connection.execute(
+                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                {"lock_key": lock_key},
+            ).scalar()
+        )
+        connection.commit()
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                connection.execute(
+                    text("SELECT pg_advisory_unlock(:lock_key)"),
+                    {"lock_key": lock_key},
+                )
+                connection.commit()
+            except Exception:
+                logger.warning("Unable to release job advisory lock for outbox=%s", outbox_id)
+        connection.close()
+
+
+def execute_outbox_job(outbox_id: str, rq_job_id: str) -> dict:
+    """Execute one outbox request with a database lease and cross-process idempotency fence."""
+    from app.services.job_execution import (
+        claim_execution,
+        complete_execution,
+        fail_execution,
+    )
+
+    # RQ executes jobs in forked workhorse processes. Dispose the inherited
+    # SQLAlchemy pool without closing parent-process connections so this child
+    # creates its own DBAPI connections before taking a lease/advisory lock.
+    engine.dispose(close=False)
+    worker_name = f"{socket.gethostname()}:{os.getpid()}"
+    with _outbox_execution_lock(outbox_id) as acquired:
+        if not acquired:
+            # Mark this RQ delivery failed rather than finished. The scheduler
+            # can then reconcile it and retry after the active process releases
+            # the advisory lock; returning success would falsely look completed.
+            logger.warning("Duplicate RQ delivery deferred; execution fence is held outbox=%s rq_job=%s", outbox_id, rq_job_id)
+            raise RuntimeError("outbox_execution_fence_busy")
+
+        execution = claim_execution(
+            outbox_id,
+            rq_job_id=rq_job_id,
+            worker_name=worker_name,
+            lease_seconds=(
+                max(30, int(settings.background_job_lease_grace_seconds))
+                + max(30, int(_outbox_timeout_seconds(outbox_id)))
+            ),
+            max_attempts=max(1, int(settings.background_job_max_execution_attempts)),
+        )
+        state = execution.get("status")
+        if state != "claimed":
+            return {"ok": state in {"already_completed", "already_running"}, "status": state, "outbox_id": outbox_id}
+
+        function_path = execution["function_path"]
+        args = execution["task_args"]
+        try:
+            if function_path == "app.worker.process_report":
+                result = process_report(*args)
+            elif function_path == "app.worker.discover_event_hypotheses":
+                result = discover_event_hypotheses(*args)
+            elif function_path == "app.worker.replay_event_history":
+                result = replay_event_history(*args)
+            else:
+                raise ValueError("Unsupported durable background function")
+
+            if isinstance(result, dict) and result.get("status") == "failed":
+                raise RuntimeError(str(result.get("failure_code") or "target_function_failed")[:80])
+
+            serialized = json.dumps(result, sort_keys=True, separators=(",", ":"), default=str)
+            result_sha256 = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+            completed = complete_execution(
+                outbox_id,
+                execution["attempt_id"],
+                execution["lease_token"],
+                result_sha256=result_sha256,
+            )
+            if not completed:
+                logger.error("Outbox execution lost its fencing lease after target completion: %s", outbox_id)
+                return {"ok": False, "status": "stale_execution_lease", "outbox_id": outbox_id}
+            return {
+                "ok": True,
+                "status": "completed",
+                "outbox_id": outbox_id,
+                "job_id": execution["job_id"],
+                "result_sha256": result_sha256,
+            }
+        except Exception as exc:
+            outcome = fail_execution(
+                outbox_id,
+                execution["attempt_id"],
+                execution["lease_token"],
+                exc,
+                max_attempts=max(1, int(settings.background_job_max_execution_attempts)),
+            )
+            logger.exception(
+                "Durable job execution failed outbox=%s attempt=%s outcome=%s",
+                outbox_id, execution["attempt_number"], outcome,
+            )
+            raise
+
+
+def _outbox_timeout_seconds(outbox_id: str) -> int:
+    """Read the bounded timeout for this logical job without exposing its arguments."""
+    db = SessionLocal()
+    try:
+        from app.db.models import BackgroundJobOutbox
+
+        row = db.get(BackgroundJobOutbox, outbox_id)
+        return max(30, int(row.job_timeout_seconds if row else 300))
     finally:
         db.close()

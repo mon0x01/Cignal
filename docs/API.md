@@ -118,3 +118,13 @@ All replay endpoints require an administrator or analyst role.
 - `GET /api/intelligence/event-replays/{run_id}/results` returns paginated candidate clusters. Optional `comparison_kind` filters `new_candidate`, `unchanged`, `expanded`, `contracted`, or `diverged` results.
 
 Replay is bounded to 500 eligible analyzed reports and a maximum 366-day observation window. Replay input and comparison-baseline snapshots are immutable and hash-validated before execution. Outputs are candidate-only analytical records; replay never mutates current event hypotheses, incidents, warnings, or response actions.
+
+
+### Background job reliability (administrator)
+
+`GET /api/admin/background-jobs/outbox` reports queue-lane counts, dispatch/execution
+attempt budgets, current state, last RQ delivery ID, last start/completion timestamps,
+and error classes. It does not return task arguments or task results.
+
+`POST /api/admin/background-jobs/outbox/{job_id}/retry` starts a new retry generation
+for a dead-lettered job while preserving the previous execution attempt ledger.

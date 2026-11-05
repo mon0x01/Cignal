@@ -28,8 +28,8 @@ for file in \
   migrations/versions/0015_acq_archive_learning.py migrations/versions/0016_incident_operations.py \
   app/api/incident_operations.py app/api/response_plans.py \
   app/services/response_playbooks.py app/services/response_orchestration.py \
-  migrations/versions/0017_response_plan_orchestration.py migrations/versions/0018_durable_job_outbox.py migrations/versions/0019_continuous_event_discovery.py migrations/versions/0020_event_evolution_replay.py \
-  app/services/job_outbox.py app/services/event_discovery_schedule.py app/services/event_replay.py docs/EVENT_EVOLUTION_REPLAY_V1.md docs/BACKGROUND_JOB_OUTBOX_V1.md docs/CONTINUOUS_EVENT_DISCOVERY_V1.md tests/test_job_outbox.py tests/test_continuous_event_discovery.py tests/test_event_replay.py docs/INCIDENT_OPERATIONS_V1.md \
+  migrations/versions/0017_response_plan_orchestration.py migrations/versions/0018_durable_job_outbox.py migrations/versions/0019_continuous_event_discovery.py migrations/versions/0020_event_evolution_replay.py migrations/versions/0021_job_execution_reliability.py \
+  app/services/job_outbox.py app/services/job_execution.py app/services/event_discovery_schedule.py app/services/event_replay.py docs/EVENT_EVOLUTION_REPLAY_V1.md docs/BACKGROUND_JOB_OUTBOX_V1.md docs/DISTRIBUTED_JOB_RELIABILITY_V1.md docs/CONTINUOUS_EVENT_DISCOVERY_V1.md tests/test_job_outbox.py tests/test_job_execution.py tests/test_worker_execution.py tests/test_continuous_event_discovery.py tests/test_event_replay.py docs/INCIDENT_OPERATIONS_V1.md \
   docs/INCIDENT_RESPONSE_ORCHESTRATION_V1.md tests/test_response_orchestration.py \
   tests/test_api_workflow.py tests/test_migrations.py \
   scripts/run_historical_backfill.py scripts/smoke_external_sources.py \
@@ -49,6 +49,19 @@ grep -Fq 'enqueue_event_replay' app/services/job_outbox.py || fail "Durable even
 grep -Fq 'def replay_event_history' app/worker.py || fail "Event replay worker entry point missing."
 grep -Fq 'baseline_manifest_sha256' app/services/event_replay.py || fail "Frozen replay comparison-baseline integrity missing."
 grep -Fq 'use_supervised_model=False' app/services/event_replay.py || fail "Deterministic replay scoring mode missing."
+grep -Fq 'execute_outbox_job' app/worker.py || fail "Outbox execution wrapper missing."
+grep -Fq 'recover_expired_executions' app/scheduler.py || fail "Expired worker execution recovery missing."
+grep -Fq 'row.last_rq_job_id != str(rq_job_id)' app/services/job_execution.py || fail "RQ delivery identity fence missing."
+grep -Fq 'row.last_rq_job_id = None' app/services/job_execution.py || fail "Failed/expired execution delivery retirement missing."
+grep -Fq 'outbox_execution_fence_busy' app/worker.py || fail "Busy execution fence does not defer duplicate RQ deliveries."
+grep -Fq 'row.last_rq_job_id = None' app/services/job_outbox.py || fail "Failed enqueue delivery retirement missing."
+grep -Fq 'pg_try_advisory_lock' app/worker.py || fail "Cross-process duplicate execution fence missing."
+grep -Fq 'engine.dispose(close=False)' app/worker.py || fail "Fork-safe SQLAlchemy pool disposal missing."
+grep -Fq 'CIGNAL_WORKER_QUEUES: cignal-priority,cignal' docker-compose.yml || fail "Primary worker queue lanes missing."
+grep -Fq 'CIGNAL_WORKER_QUEUES: cignal-bulk' docker-compose.yml || fail "Bulk worker queue lane missing."
+grep -Fq 'stop_grace_period: 65m' docker-compose.yml || fail "Worker graceful-shutdown budget missing."
+grep -Fq 'CIGNAL_WORKER_QUEUES' app/worker.py || fail "Worker queue-lane configuration missing."
+grep -Fq 'worker-bulk:' docker-compose.yml || fail "Bulk worker service missing."
 grep -Fq 'continuous_event_discovery_enabled' app/core/config.py || fail "Continuous event discovery configuration missing."
 echo "Release files and source contracts: PASS"
 
@@ -57,14 +70,14 @@ printf '\n'
 compose config --quiet
 echo "Compose configuration: PASS"
 
-printf '\n========== 3/9 · SIX REQUIRED SERVICES =========='
+printf '\n========== 3/9 · SEVEN REQUIRED SERVICES =========='
 printf '\n'
 compose ps
 running="$(compose ps --status running --services)"
-for service in api db frontend redis worker scheduler; do
+for service in api db frontend redis worker worker-bulk scheduler; do
   grep -Fxq "$service" <<<"$running" || fail "Service '$service' is not running."
 done
-echo "Six required services running: PASS"
+echo "Seven required services running: PASS"
 
 printf '\n========== 4/9 · COMPILE, FULL TESTS AND STATIC SECURITY =========='
 printf '\n'
@@ -77,7 +90,7 @@ compose exec -T --interactive=false api sh -lc '
   passed_line="$(printf "%s\\n" "$test_output" | grep -Eo "[0-9]+ passed" | tail -n1 || true)"
   passed="${passed_line%% *}"
   test -n "$passed" || { echo "Pytest summary missing."; exit 1; }
-  test "$passed" -ge 279 || { echo "Only $passed tests passed; expected at least 279."; exit 1; }
+  test "$passed" -ge 297 || { echo "Only $passed tests passed; expected at least 297."; exit 1; }
   ruff check app tests migrations scripts
   bandit -q -r app -lll
   echo "Ruff: PASS; Bandit high-severity scan: PASS"
@@ -87,7 +100,7 @@ printf '\n========== 5/9 · MIGRATION AND DATABASE SCHEMA =========='
 printf '\n'
 current="$(compose exec -T --interactive=false api alembic current 2>&1)"
 printf '%s\n' "$current"
-grep -Fq '0020_event_evolution_replay' <<<"$current" || fail "Expected migration 0020_event_evolution_replay is not current."
+grep -Fq '0021_job_execution_reliability' <<<"$current" || fail "Expected migration 0021_job_execution_reliability is not current."
 compose exec -T --interactive=false api python - <<'PY'
 from sqlalchemy import inspect
 from app.db.session import engine
@@ -101,12 +114,13 @@ required = {
     "incident_actions", "incident_action_events", "incident_response_plans",
     "incident_action_dependencies", "background_job_outbox",
     "event_replay_runs", "event_replay_inputs", "event_replay_baselines", "event_replay_results",
+    "background_job_execution_attempts",
 }
 actual = set(inspector.get_table_names())
 missing = sorted(required - actual)
 if missing:
     raise SystemExit(f"Missing expected tables: {missing}")
-print(f"Acquisition archive/learning + previous governance tables: {len(required)}/{len(required)} present")
+print(f"Acquisition, governance and execution-ledger tables: {len(required)}/{len(required)} present")
 for table, unique_name in (
     ("acquisition_observations", "uq_acq_observation_version"),
     ("acquisition_backfill_items", "uq_acq_backfill_item_observation"),
@@ -123,6 +137,8 @@ if "uq_background_job_outbox_job_id" not in job_outbox_constraints:
 job_outbox_indexes = {item.get("name") for item in inspector.get_indexes("background_job_outbox")}
 if "ix_background_job_outbox_status_available" not in job_outbox_indexes:
     raise SystemExit("Due-job outbox dispatch index missing")
+if "ix_background_job_outbox_execution_lease" not in job_outbox_indexes:
+    raise SystemExit("Execution-lease recovery index missing")
 job_outbox_checks = {
     item.get("name") for item in inspector.get_check_constraints("background_job_outbox")
 }
@@ -132,6 +148,38 @@ if not {
     "ck_background_job_outbox_timeout",
 }.issubset(job_outbox_checks):
     raise SystemExit("Background-job outbox database check constraints missing")
+outbox_columns = {item["name"] for item in inspector.get_columns("background_job_outbox")}
+if not {
+    "last_rq_job_id", "execution_attempts", "execution_generation",
+    "execution_lease_token", "execution_lease_expires_at",
+    "last_started_at", "completed_at", "last_execution_error_code",
+}.issubset(outbox_columns):
+    raise SystemExit("Durable background-job execution columns missing")
+if not {
+    "ck_background_job_outbox_execution_attempts",
+    "ck_background_job_outbox_execution_generation",
+}.issubset(job_outbox_checks):
+    raise SystemExit("Background-job execution budget check constraints missing")
+execution_unique = {
+    item.get("name") for item in inspector.get_unique_constraints("background_job_execution_attempts")
+}
+if "uq_background_job_execution_generation_attempt" not in execution_unique:
+    raise SystemExit("Execution attempt generation/number uniqueness missing")
+execution_checks = {
+    item.get("name") for item in inspector.get_check_constraints("background_job_execution_attempts")
+}
+if not {
+    "ck_background_job_execution_attempt_number", "ck_background_job_execution_status",
+}.issubset(execution_checks):
+    raise SystemExit("Execution attempt status/budget checks missing")
+execution_indexes = {
+    item.get("name") for item in inspector.get_indexes("background_job_execution_attempts")
+}
+if not {
+    "ix_background_job_execution_outbox_started",
+    "ix_background_job_execution_status_started",
+}.issubset(execution_indexes):
+    raise SystemExit("Execution attempt history indexes missing")
 replay_unique = {
     item.get("name") for item in inspector.get_unique_constraints("event_replay_baselines")
 }
@@ -257,13 +305,14 @@ echo "API/frontend/PostgreSQL/Redis: PASS"
 printf '\n========== 8/9 · PERSISTENT STORAGE =========='
 printf '\n'
 compose exec -T --interactive=false api sh -lc 'test -d /data/evidence && test -w /data/evidence && test -d /data/models && test -w /data/models && echo "API evidence/model storage writable: PASS"'
-compose exec -T --interactive=false worker sh -lc 'test -d /data/models && test -r /data/models && echo "Worker model storage readable: PASS"'
+compose exec -T --interactive=false worker sh -lc 'test -d /data/models && test -r /data/models && echo "Primary worker model storage readable: PASS"'
+compose exec -T --interactive=false worker-bulk sh -lc 'test -d /data/models && test -r /data/models && echo "Bulk worker model storage readable: PASS"'
 
 printf '\n========== 9/9 · LIVE ACQUISITION SAFETY =========='
 printf '\n'
 echo "No provider smoke test or live ingestion was triggered by this verifier."
 echo "Run scripts/smoke_external_sources.py for read-only network checks."
 echo "Run scripts/verify_live_acquisition_e2e.py only when ready to write bounded real USGS data."
-printf '\nALL CIGNAL ACQUISITION, INTELLIGENCE, INCIDENT OPERATIONS, RESPONSE ORCHESTRATION, DURABLE JOB OUTBOX AND EVENT REPLAY QUALITY GATES PASSED.\n'
-printf 'Migration: 0020_event_evolution_replay\n'
+printf '\nALL CIGNAL ACQUISITION, INTELLIGENCE, INCIDENT OPERATIONS, RESPONSE ORCHESTRATION, EVENT REPLAY AND DISTRIBUTED JOB RELIABILITY QUALITY GATES PASSED.\n'
+printf 'Migration: 0021_job_execution_reliability\n'
 printf 'No existing database/evidence/Redis/model volumes were reset.\n'

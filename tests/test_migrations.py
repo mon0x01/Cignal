@@ -18,6 +18,7 @@ def test_alembic_migrations_create_schema_and_encrypted_mfa_columns():
         "event_pair_candidates", "model_evaluation_runs", "incident_actions", "incident_action_events",
         "incident_response_plans", "incident_action_dependencies", "background_job_outbox",
         "event_replay_runs", "event_replay_inputs", "event_replay_baselines", "event_replay_results",
+        "background_job_execution_attempts",
     }.issubset(tables)
     user_columns = {column["name"]: column for column in inspector.get_columns("users")}
     report_columns = {column["name"]: column for column in inspector.get_columns("reports")}
@@ -35,7 +36,7 @@ def test_alembic_migrations_create_schema_and_encrypted_mfa_columns():
         version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
     run_columns = {column["name"]: column for column in inspector.get_columns("integration_runs")}
     assert {"source_type", "status", "records_fetched", "records_inserted", "records_duplicate", "records_rejected", "retryable"}.issubset(run_columns)
-    assert version == "0020_event_evolution_replay"
+    assert version == "0021_job_execution_reliability"
     assert len(version) <= 32
     assert "source_observed_at" in report_columns
     assert {"analysis_revision", "analyzed_revision"}.issubset(report_columns)
@@ -612,4 +613,71 @@ def test_0020_event_evolution_replay_migration_is_idempotent_and_preserves_paren
             "ck_event_replay_result_counts", "ck_event_replay_result_score",
             "ck_event_replay_result_overlap", "ck_event_replay_result_comparison",
         }.issubset(result_checks)
+    engine.dispose()
+
+
+def test_0021_migration_adds_execution_leases_and_preserves_enqueued_jobs_idempotently():
+    import importlib
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import create_engine, inspect, text
+
+    engine = create_engine("sqlite:///:memory:")
+    migration_0018 = importlib.import_module("migrations.versions.0018_durable_job_outbox")
+    migration_0021 = importlib.import_module("migrations.versions.0021_job_execution_reliability")
+    with engine.begin() as connection:
+        context = MigrationContext.configure(connection)
+        with Operations.context(context):
+            migration_0018.upgrade()
+        connection.execute(text("""
+            INSERT INTO background_job_outbox (
+                id, job_id, function_path, task_args, queue_name,
+                job_timeout_seconds, result_ttl_seconds, status, attempts,
+                available_at, enqueued_at, created_at, updated_at
+            ) VALUES (
+                'legacy-id', 'legacy-job', 'app.worker.process_report', '[]', 'cignal',
+                300, 3600, 'enqueued', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO background_job_outbox (
+                id, job_id, function_path, task_args, queue_name,
+                job_timeout_seconds, result_ttl_seconds, status, attempts,
+                available_at, lease_token, lease_expires_at, created_at, updated_at
+            ) VALUES (
+                'legacy-publishing-id', 'legacy-publishing-job', 'app.worker.process_report',
+                '[]', 'cignal', 300, 3600, 'publishing', 1, CURRENT_TIMESTAMP,
+                'legacy-lease', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+        """))
+        context = MigrationContext.configure(connection)
+        with Operations.context(context):
+            migration_0021.upgrade()
+            migration_0021.upgrade()
+
+        inspector = inspect(connection)
+        columns = {item["name"] for item in inspector.get_columns("background_job_outbox")}
+        assert {
+            "last_rq_job_id", "execution_attempts", "execution_generation",
+            "execution_lease_token", "execution_lease_expires_at",
+            "last_started_at", "completed_at", "last_execution_error_code",
+        }.issubset(columns)
+        assert inspector.has_table("background_job_execution_attempts")
+        outbox_indexes = {item["name"] for item in inspector.get_indexes("background_job_outbox")}
+        assert "ix_background_job_outbox_execution_lease" in outbox_indexes
+        checks = {item.get("name") for item in inspector.get_check_constraints("background_job_outbox")}
+        assert "ck_background_job_outbox_status" in checks
+        row = connection.execute(
+            text("SELECT status, last_rq_job_id, execution_attempts FROM background_job_outbox WHERE id='legacy-id'")
+        ).one()
+        assert row.status == "enqueued"
+        assert row.last_rq_job_id == "legacy-job"
+        assert row.execution_attempts == 0
+        publishing = connection.execute(
+            text("SELECT status, last_rq_job_id FROM background_job_outbox WHERE id='legacy-publishing-id'")
+        ).one()
+        assert publishing.status == "publishing"
+        assert publishing.last_rq_job_id == "legacy-publishing-job"
     engine.dispose()

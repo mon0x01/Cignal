@@ -74,7 +74,7 @@ def test_report_analysis_outbox_is_idempotent_and_revision_scoped(outbox_session
 def test_dispatch_marks_job_enqueued_and_is_safe_after_scheduler_replay(outbox_sessions):
     with outbox_sessions() as db:
         row = enqueue_report_analysis(db, "report-456", 3)
-        expected_job_id = row.job_id
+        row_id = row.id
         db.commit()
 
     queue = FakeQueue()
@@ -84,12 +84,16 @@ def test_dispatch_marks_job_enqueued_and_is_safe_after_scheduler_replay(outbox_s
     assert first == {"claimed": 1, "enqueued": 1, "retried": 0, "dead": 0, "lease_lost": 0}
     assert second["claimed"] == 0
     assert len(queue.jobs) == 1
-    assert queue.jobs[expected_job_id].args == ("report-456", 3)
+    queued = next(iter(queue.jobs.values()))
+    assert queued.function_path == "app.worker.execute_outbox_job"
+    assert queued.args[0] == row_id
+    assert queued.args[1].startswith("cignal-delivery-")
     with outbox_sessions() as db:
         stored = db.query(BackgroundJobOutbox).one()
         assert stored.status == "enqueued"
         assert stored.enqueued_at is not None
         assert stored.lease_token is None
+        assert stored.last_rq_job_id == queued.id
 
 
 def test_dispatch_failure_uses_exponential_backoff_without_losing_request(outbox_sessions):
@@ -158,9 +162,12 @@ def test_event_discovery_outbox_is_idempotent_and_uses_durable_dispatch(outbox_s
     queue = FakeQueue()
     result = dispatch_pending_jobs(queue, session_factory=outbox_sessions)
     assert result["enqueued"] == 1
-    queued = queue.jobs["cignal-event-discovery-discovery-run-001"]
-    assert queued.function_path == "app.worker.discover_event_hypotheses"
-    assert queued.args == ("discovery-run-001", parameters)
+    queued = next(iter(queue.jobs.values()))
+    assert queued.function_path == "app.worker.execute_outbox_job"
+    assert len(queued.args) == 2
+    assert queued.args[1] == queued.id
     with outbox_sessions() as db:
         stored = db.query(BackgroundJobOutbox).one()
         assert stored.status == "enqueued"
+        assert stored.queue_name == "cignal"
+        assert stored.last_rq_job_id == queued.id

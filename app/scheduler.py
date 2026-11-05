@@ -10,6 +10,7 @@ from app.db.session import SessionLocal
 from app.integrations.registry import connectors
 from app.services.acquisition_schedule import claim_due_sources, release_source_claim
 from app.services.event_discovery_schedule import schedule_continuous_event_discovery
+from app.services.job_execution import reconcile_enqueued_jobs, recover_expired_executions
 from app.services.job_outbox import dispatch_pending_jobs
 from app.services.scheduler_jobs import enqueue_daily_evidence_integrity_audit
 
@@ -141,7 +142,9 @@ def _recover_pair_candidate_mining(queue) -> int:
 
 def main():
     redis = Redis.from_url(settings.redis_url)
-    queue = Queue("cignal", connection=redis)
+    queue_names = ("cignal-priority", "cignal", "cignal-bulk")
+    queues = {name: Queue(name, connection=redis) for name in queue_names}
+    queue = queues["cignal"]
     tick = max(15, min(300, int(settings.ingest_scheduler_tick_seconds)))
     logger.info("Per-source acquisition scheduler active; tick=%s seconds", tick)
     while True:
@@ -161,13 +164,33 @@ def main():
                 except Exception:
                     logger.exception("Continuous event-discovery scheduling cycle failed")
                 try:
-                    outbox_result = dispatch_pending_jobs(queue, batch_size=100)
+                    execution_recovery = recover_expired_executions(
+                        batch_size=100,
+                        max_attempts=settings.background_job_max_execution_attempts,
+                    )
+                    delivery_recovery = reconcile_enqueued_jobs(
+                        queues,
+                        batch_size=200,
+                        grace_seconds=settings.background_job_reconcile_grace_seconds,
+                        lease_grace_seconds=settings.background_job_lease_grace_seconds,
+                        max_dispatch_attempts=settings.background_job_dispatch_max_attempts,
+                    )
+                    if execution_recovery["checked"] or delivery_recovery["checked"]:
+                        logger.warning(
+                            "Background-job recovery execution=%s delivery=%s",
+                            execution_recovery, delivery_recovery,
+                        )
+                    outbox_result = dispatch_pending_jobs(
+                        queues,
+                        batch_size=100,
+                        max_attempts=settings.background_job_dispatch_max_attempts,
+                    )
                     if outbox_result["claimed"]:
                         logger.info("Durable job outbox dispatch: %s", outbox_result)
                 except Exception:
-                    # An outbox relay failure must not block independent acquisition,
+                    # A relay/recovery failure must not block independent acquisition,
                     # retention, integrity-audit or backup scheduling.
-                    logger.exception("Durable job outbox dispatch cycle failed")
+                    logger.exception("Durable job execution recovery/dispatch cycle failed")
                 scheduled = _schedule_due_source_jobs(redis, queue)
                 recovered_backfills = _recover_acquisition_backfills(queue)
                 recovered_mining = _recover_pair_candidate_mining(queue)
