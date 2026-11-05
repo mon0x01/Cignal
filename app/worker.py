@@ -701,6 +701,7 @@ def discover_event_hypotheses(run_id: str, parameters: dict | None = None) -> di
             "semantic": result.get("semantic", {"status": "unknown"}),
             "supervised_pair_model": result.get("supervised_pair_model", {"available": False}),
             "scoring_version": result.get("scoring_version"),
+            "clustering_metrics": result.get("clustering_metrics", {}),
         }
         run.completed_at = completed_at
         run.duration_ms = max(0, int((completed_at - started_at).total_seconds() * 1000))

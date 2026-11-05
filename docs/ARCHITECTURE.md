@@ -142,3 +142,8 @@ across scheduler replicas. The discovery run and its RQ dispatch intent are comm
 atomically through the durable job outbox. Event hypotheses remain candidate-only;
 continuous discovery never creates or verifies incidents and never issues warnings
 or dispatches resources. See `docs/CONTINUOUS_EVENT_DISCOVERY_V1.md`.
+
+
+## Event evolution execution scale
+
+The event hypothesis clusterer uses a disaster-type and spatial grid over cluster anchors with time-based expiry. This is a conservative candidate prefilter; exact haversine, temporal, pair-score and complete-link checks remain authoritative. Historical replay freezes full membership only for hypotheses that overlap its immutable input set, then uses an inverted report-to-hypothesis index for Jaccard comparison. Existing input/window bounds and all human-review safeguards remain in place. See `docs/EVENT_EVOLUTION_SCALE_V1.md`.

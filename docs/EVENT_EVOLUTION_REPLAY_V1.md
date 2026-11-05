@@ -17,7 +17,7 @@ The frozen payload contains only fields required by the correlation scorer. It i
 
 A replay pins both its input set and the comparison baseline as of request time. A replay pins:
 
-- engine version (`event-evolution-replay-v1`),
+- engine version (`event-evolution-replay-v1` for original runs; `event-evolution-replay-v2-indexed` for new indexed runs),
 - event scoring version,
 - scoring thresholds and spatial/temporal bounds,
 - exact input report payloads through input and aggregate manifest hashes.
@@ -34,7 +34,7 @@ Each replay cluster is compared with current event hypotheses using report-ID Ja
 - `contracted`: replay cluster is a strict subset of current membership,
 - `diverged`: partial overlap without set containment.
 
-These are comparative labels, not probabilities or declarations of event identity. The highest-overlap hypothesis is selected deterministically; ties are resolved by overlap count and hypothesis ID.
+These are comparative labels, not probabilities or declarations of event identity. The highest-overlap hypothesis is selected deterministically; ties are resolved by overlap count and hypothesis ID. The v2 engine uses a report-to-hypothesis inverted index to calculate overlap only for hypotheses sharing at least one input report. At request time it freezes only potentially overlapping hypotheses, but preserves each selected hypothesis's complete active report membership so Jaccard semantics do not change.
 
 ## API
 
@@ -56,5 +56,5 @@ Only administrators and analysts can access these endpoints. Requests are rate-l
 
 ## Known limitations
 
-- Replay is bounded to 500 reports to constrain pairwise clustering complexity.
-- Replay output is research/analyst decision support and requires human review.
+- Replay is bounded to 500 reports to constrain pairwise clustering complexity. The indexed broad phase prunes spatially/temporally impossible cluster anchors; a single dense event can still require quadratic pairwise checks.
+- Replay output is research/analyst decision support and requires human review. See `docs/EVENT_EVOLUTION_SCALE_V1.md` for the indexed discovery and replay implementation.

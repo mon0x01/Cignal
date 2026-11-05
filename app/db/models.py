@@ -443,6 +443,10 @@ class EventHypothesisReport(Base):
     __table_args__ = (
         UniqueConstraint("hypothesis_id", "report_id", name="uq_event_hypothesis_report"),
         Index("ix_event_hypothesis_reports_review", "hypothesis_id", "association_status"),
+        Index(
+            "ix_event_hypothesis_reports_report_status_hypothesis",
+            "report_id", "association_status", "hypothesis_id",
+        ),
     )
 
 

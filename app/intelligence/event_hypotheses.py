@@ -10,7 +10,9 @@ import json
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from heapq import heappop, heappush
 from itertools import combinations
+from math import asin, cos, degrees, floor, pi, radians, sin
 from statistics import mean
 from uuid import uuid4
 
@@ -32,6 +34,10 @@ SUPPORTED_DISASTER_TYPES = frozenset({"flood", "earthquake", "fire", "cyclone", 
 DEFAULT_MINIMUM_PAIR_SCORE = 0.62
 DEFAULT_MAX_DISTANCE_KM = 25.0
 DEFAULT_MAX_TIME_GAP_HOURS = 72.0
+_SPATIAL_INDEX_CELL_DEGREES = 1.0
+_EARTH_RADIUS_KM = 6371.0
+_LATITUDE_CELL_COUNT = int(180 / _SPATIAL_INDEX_CELL_DEGREES)
+_LONGITUDE_CELL_COUNT = int(360 / _SPATIAL_INDEX_CELL_DEGREES)
 
 
 def _event_time(report) -> datetime | None:
@@ -140,6 +146,49 @@ def _pair_result(
     return result
 
 
+def _spatial_index_cells(latitude: float, longitude: float, max_distance_km: float) -> tuple[range, tuple[int, ...]]:
+    """Return a conservative grid-cell cover for a spherical distance query.
+
+    The bounds are deliberately wider than the exact haversine circle. Exact
+    distance checks remain in ``_pair_result``; this helper may admit false
+    positives but must never prune a valid complete-link candidate.
+    """
+    angular_radius = min(pi, float(max_distance_km) / _EARTH_RADIUS_KM)
+    latitude_radians = radians(float(latitude))
+    latitude_delta = degrees(angular_radius) + 1e-9
+    minimum_latitude = max(-90.0, float(latitude) - latitude_delta)
+    maximum_latitude = min(90.0, float(latitude) + latitude_delta)
+    minimum_latitude_cell = max(
+        0, floor((minimum_latitude + 90.0) / _SPATIAL_INDEX_CELL_DEGREES)
+    )
+    maximum_latitude_cell = min(
+        _LATITUDE_CELL_COUNT,
+        floor((maximum_latitude + 90.0) / _SPATIAL_INDEX_CELL_DEGREES),
+    )
+    latitude_cells = range(minimum_latitude_cell, maximum_latitude_cell + 1)
+
+    # A spherical cap touching either pole can contain every longitude. Away
+    # from the poles, asin(sin(radius) / cos(latitude)) is the exact maximum
+    # longitude displacement of the cap boundary at the centre latitude.
+    if abs(latitude_radians) + angular_radius >= pi / 2 or angular_radius >= pi / 2:
+        longitude_cells = tuple(range(_LONGITUDE_CELL_COUNT))
+    else:
+        denominator = max(cos(latitude_radians), 1e-12)
+        ratio = min(1.0, max(0.0, sin(angular_radius) / denominator))
+        longitude_delta = degrees(asin(ratio)) + 1e-9
+        longitude_position = (
+            ((float(longitude) + 180.0) % 360.0) / _SPATIAL_INDEX_CELL_DEGREES
+        )
+        longitude_delta_cells = longitude_delta / _SPATIAL_INDEX_CELL_DEGREES
+        first_cell = floor(longitude_position - longitude_delta_cells)
+        last_cell = floor(longitude_position + longitude_delta_cells)
+        longitude_cells = tuple(sorted({
+            cell % _LONGITUDE_CELL_COUNT
+            for cell in range(first_cell, last_cell + 1)
+        }))
+    return latitude_cells, longitude_cells
+
+
 def build_candidate_clusters(
     reports,
     *,
@@ -148,8 +197,16 @@ def build_candidate_clusters(
     max_time_gap_hours: float = DEFAULT_MAX_TIME_GAP_HOURS,
     semantic_similarities: dict[tuple[str, str], float] | None = None,
     use_supervised_model: bool = True,
+    diagnostics: dict | None = None,
 ) -> list[dict]:
-    """Build deterministic disjoint complete-link clusters from eligible reports."""
+    """Build deterministic disjoint complete-link clusters using an anchor index.
+
+    Every valid cluster must be compatible with its first (anchor) report. The
+    spatiotemporal index therefore removes clusters that cannot possibly accept
+    the incoming report before the exact pairwise scorer is called. Candidate
+    ordering and complete-link checks remain identical to the original greedy
+    algorithm, so the index changes work performed, not clustering semantics.
+    """
     if not 0.0 <= minimum_pair_score <= 1.0:
         raise ValueError("minimum_pair_score must be between 0 and 1")
     if not 0.1 <= max_distance_km <= 500.0:
@@ -166,10 +223,27 @@ def build_candidate_clusters(
 
     clusters: list[list] = []
     pair_cache: dict[tuple[str, str], dict | None] = {}
+    cluster_buckets: dict[tuple[str, int, int], set[int]] = {}
+    expiry_heap: list[tuple[float, int, tuple[str, int, int]]] = []
+    maximum_age_seconds = float(max_time_gap_hours) * 3600.0
+    stats = {
+        "algorithm": "indexed_greedy_complete_link_v1",
+        "reports_considered": len(ordered),
+        "naive_cluster_candidates": 0,
+        "indexed_cluster_candidates": 0,
+        "cluster_candidates_pruned": 0,
+        "pair_requests": 0,
+        "pair_score_evaluations": 0,
+        "pair_cache_hits": 0,
+        "accepted_pairwise_links": 0,
+        "spatial_index_cell_size_degrees": _SPATIAL_INDEX_CELL_DEGREES,
+    }
 
     def pair(first, second):
         key = tuple(sorted((str(first.id), str(second.id))))
+        stats["pair_requests"] += 1
         if key not in pair_cache:
+            stats["pair_score_evaluations"] += 1
             pair_cache[key] = _pair_result(
                 first, second,
                 minimum_pair_score=minimum_pair_score,
@@ -178,25 +252,66 @@ def build_candidate_clusters(
                 semantic_similarity=(semantic_similarities or {}).get(key),
                 use_supervised_model=use_supervised_model,
             )
+        else:
+            stats["pair_cache_hits"] += 1
         return pair_cache[key]
 
     for report in ordered:
+        report_time = _event_time(report)
+        report_timestamp = report_time.timestamp()
+        expiration_cutoff = report_timestamp - maximum_age_seconds
+        while expiry_heap and expiry_heap[0][0] < expiration_cutoff:
+            _anchor_timestamp, expired_index, expired_bucket = heappop(expiry_heap)
+            indexed = cluster_buckets.get(expired_bucket)
+            if indexed is not None:
+                indexed.discard(expired_index)
+                if not indexed:
+                    cluster_buckets.pop(expired_bucket, None)
+
+        latitude_cells, longitude_cells = _spatial_index_cells(
+            float(report.latitude), float(report.longitude), max_distance_km
+        )
+        disaster_type = str(report.disaster_type).lower()
+        candidate_indices = set()
+        for latitude_cell in latitude_cells:
+            for longitude_cell in longitude_cells:
+                candidate_indices.update(cluster_buckets.get(
+                    (disaster_type, latitude_cell, longitude_cell), ()
+                ))
+
+        stats["naive_cluster_candidates"] += len(clusters)
+        stats["indexed_cluster_candidates"] += len(candidate_indices)
+        stats["cluster_candidates_pruned"] += len(clusters) - len(candidate_indices)
+
         compatible = []
-        for cluster in clusters:
+        # Sorting the original creation indexes preserves the stable tie order
+        # of the prior full scan (the earlier-created cluster wins exact ties).
+        for cluster_index in sorted(candidate_indices):
+            cluster = clusters[cluster_index]
             scores = [pair(report, member) for member in cluster]
             if scores and all(item is not None for item in scores):
                 compatible.append((
                     min(item["score"] for item in scores),
                     mean(item["score"] for item in scores),
                     len(cluster),
-                    cluster,
+                    cluster_index,
                 ))
         if compatible:
-            # Prefer strongest worst-case link, then mean link, then larger cluster.
             compatible.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-            compatible[0][3].append(report)
+            clusters[compatible[0][3]].append(report)
         else:
+            cluster_index = len(clusters)
             clusters.append([report])
+            anchor_bucket = (
+                disaster_type,
+                floor((float(report.latitude) + 90.0) / _SPATIAL_INDEX_CELL_DEGREES),
+                floor(
+                    ((float(report.longitude) + 180.0) % 360.0)
+                    / _SPATIAL_INDEX_CELL_DEGREES
+                ),
+            )
+            cluster_buckets.setdefault(anchor_bucket, set()).add(cluster_index)
+            heappush(expiry_heap, (report_timestamp, cluster_index, anchor_bucket))
 
     output = []
     for cluster in clusters:
@@ -241,6 +356,15 @@ def build_candidate_clusters(
         })
 
     output.sort(key=lambda item: (item["last_observed_at"], item["anchor_report_id"]), reverse=True)
+    stats["clusters_created"] = len(clusters)
+    stats["clusters_returned"] = len(output)
+    stats["accepted_pairwise_links"] = sum(len(item["pairwise"]) for item in output)
+    stats["naive_candidate_reduction_pct"] = round(
+        100.0 * stats["cluster_candidates_pruned"] / stats["naive_cluster_candidates"], 2
+    ) if stats["naive_cluster_candidates"] else 0.0
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update(stats)
     return output
 
 
@@ -569,12 +693,14 @@ def discover_event_hypotheses(
         "interpretation": "Cosine similarity from a configured multilingual SentenceTransformer; not a probability.",
         "supervised_pair_model": supervised_status,
     }
+    clustering_metrics = {}
     clusters = build_candidate_clusters(
         reports,
         minimum_pair_score=minimum_pair_score,
         max_distance_km=max_distance_km,
         max_time_gap_hours=float(window_hours),
         semantic_similarities=embedding_batch.similarities,
+        diagnostics=clustering_metrics,
     )
 
     created = updated = skipped = snapshots_written = 0
@@ -667,7 +793,7 @@ def discover_event_hypotheses(
                 explanation={
                     "score_kind": "heuristic_match_score_not_probability",
                     "scoring_version": SCORING_VERSION,
-                    "clustering_method": "greedy_complete_link",
+                    "clustering_method": "indexed_greedy_complete_link",
                     "minimum_pair_score": minimum_pair_score,
                     "maximum_distance_km": max_distance_km,
                     "maximum_time_gap_hours": window_hours,
@@ -736,4 +862,5 @@ def discover_event_hypotheses(
         "semantic": semantic_status,
         "supervised_pair_model": supervised_status,
         "scoring_version": SCORING_VERSION,
+        "clustering_metrics": clustering_metrics,
     }

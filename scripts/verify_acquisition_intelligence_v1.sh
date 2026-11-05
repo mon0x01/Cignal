@@ -28,8 +28,8 @@ for file in \
   migrations/versions/0015_acq_archive_learning.py migrations/versions/0016_incident_operations.py \
   app/api/incident_operations.py app/api/response_plans.py \
   app/services/response_playbooks.py app/services/response_orchestration.py \
-  migrations/versions/0017_response_plan_orchestration.py migrations/versions/0018_durable_job_outbox.py migrations/versions/0019_continuous_event_discovery.py migrations/versions/0020_event_evolution_replay.py migrations/versions/0021_job_execution_reliability.py \
-  app/services/job_outbox.py app/services/job_execution.py app/services/event_discovery_schedule.py app/services/event_replay.py docs/EVENT_EVOLUTION_REPLAY_V1.md docs/BACKGROUND_JOB_OUTBOX_V1.md docs/DISTRIBUTED_JOB_RELIABILITY_V1.md docs/CONTINUOUS_EVENT_DISCOVERY_V1.md tests/test_job_outbox.py tests/test_job_execution.py tests/test_worker_execution.py tests/test_continuous_event_discovery.py tests/test_event_replay.py docs/INCIDENT_OPERATIONS_V1.md \
+  migrations/versions/0017_response_plan_orchestration.py migrations/versions/0018_durable_job_outbox.py migrations/versions/0019_continuous_event_discovery.py migrations/versions/0020_event_evolution_replay.py migrations/versions/0021_job_execution_reliability.py migrations/versions/0022_event_evolution_scale.py \
+  app/services/job_outbox.py app/services/job_execution.py app/services/event_discovery_schedule.py app/services/event_replay.py docs/EVENT_EVOLUTION_REPLAY_V1.md docs/EVENT_EVOLUTION_SCALE_V1.md docs/BACKGROUND_JOB_OUTBOX_V1.md docs/DISTRIBUTED_JOB_RELIABILITY_V1.md docs/CONTINUOUS_EVENT_DISCOVERY_V1.md tests/test_job_outbox.py tests/test_job_execution.py tests/test_worker_execution.py tests/test_continuous_event_discovery.py tests/test_event_replay.py tests/test_event_hypotheses.py docs/INCIDENT_OPERATIONS_V1.md \
   docs/INCIDENT_RESPONSE_ORCHESTRATION_V1.md tests/test_response_orchestration.py \
   tests/test_api_workflow.py tests/test_migrations.py \
   scripts/run_historical_backfill.py scripts/smoke_external_sources.py \
@@ -49,6 +49,8 @@ grep -Fq 'enqueue_event_replay' app/services/job_outbox.py || fail "Durable even
 grep -Fq 'def replay_event_history' app/worker.py || fail "Event replay worker entry point missing."
 grep -Fq 'baseline_manifest_sha256' app/services/event_replay.py || fail "Frozen replay comparison-baseline integrity missing."
 grep -Fq 'use_supervised_model=False' app/services/event_replay.py || fail "Deterministic replay scoring mode missing."
+grep -Fq 'event-evolution-replay-v2-indexed' app/services/event_replay.py || fail "Indexed event replay engine missing."
+grep -Fq '_spatial_index_cells' app/intelligence/event_hypotheses.py || fail "Spatial event-cluster index missing."
 grep -Fq 'execute_outbox_job' app/worker.py || fail "Outbox execution wrapper missing."
 grep -Fq 'recover_expired_executions' app/scheduler.py || fail "Expired worker execution recovery missing."
 grep -Fq 'row.last_rq_job_id != str(rq_job_id)' app/services/job_execution.py || fail "RQ delivery identity fence missing."
@@ -90,7 +92,7 @@ compose exec -T --interactive=false api sh -lc '
   passed_line="$(printf "%s\\n" "$test_output" | grep -Eo "[0-9]+ passed" | tail -n1 || true)"
   passed="${passed_line%% *}"
   test -n "$passed" || { echo "Pytest summary missing."; exit 1; }
-  test "$passed" -ge 297 || { echo "Only $passed tests passed; expected at least 297."; exit 1; }
+  test "$passed" -ge 302 || { echo "Only $passed tests passed; expected at least 302."; exit 1; }
   ruff check app tests migrations scripts
   bandit -q -r app -lll
   echo "Ruff: PASS; Bandit high-severity scan: PASS"
@@ -100,7 +102,7 @@ printf '\n========== 5/9 · MIGRATION AND DATABASE SCHEMA =========='
 printf '\n'
 current="$(compose exec -T --interactive=false api alembic current 2>&1)"
 printf '%s\n' "$current"
-grep -Fq '0021_job_execution_reliability' <<<"$current" || fail "Expected migration 0021_job_execution_reliability is not current."
+grep -Fq '0022_event_evolution_scale' <<<"$current" || fail "Expected migration 0022_event_evolution_scale is not current."
 compose exec -T --interactive=false api python - <<'PY'
 from sqlalchemy import inspect
 from app.db.session import engine
@@ -222,6 +224,11 @@ if not {"trigger_kind", "dedupe_key"}.issubset(discovery_columns):
 discovery_indexes = {item.get("name") for item in inspector.get_indexes("event_discovery_runs")}
 if "uq_event_discovery_runs_dedupe_key" not in discovery_indexes:
     raise SystemExit("Continuous event-discovery deduplication index missing")
+association_indexes = {
+    item.get("name") for item in inspector.get_indexes("event_hypothesis_reports")
+}
+if "ix_event_hypothesis_reports_report_status_hypothesis" not in association_indexes:
+    raise SystemExit("Indexed replay baseline lookup index missing")
 report_indexes = {item.get("name") for item in inspector.get_indexes("reports")}
 if "ix_reports_updated_at" not in report_indexes:
     raise SystemExit("Continuous event-discovery scan index missing")
@@ -313,6 +320,6 @@ printf '\n'
 echo "No provider smoke test or live ingestion was triggered by this verifier."
 echo "Run scripts/smoke_external_sources.py for read-only network checks."
 echo "Run scripts/verify_live_acquisition_e2e.py only when ready to write bounded real USGS data."
-printf '\nALL CIGNAL ACQUISITION, INTELLIGENCE, INCIDENT OPERATIONS, RESPONSE ORCHESTRATION, EVENT REPLAY AND DISTRIBUTED JOB RELIABILITY QUALITY GATES PASSED.\n'
-printf 'Migration: 0021_job_execution_reliability\n'
+printf '\nALL CIGNAL ACQUISITION, INTELLIGENCE, INCIDENT OPERATIONS, RESPONSE ORCHESTRATION, EVENT EVOLUTION SCALE, EVENT REPLAY AND DISTRIBUTED JOB RELIABILITY QUALITY GATES PASSED.\n'
+printf 'Migration: 0022_event_evolution_scale\n'
 printf 'No existing database/evidence/Redis/model volumes were reset.\n'

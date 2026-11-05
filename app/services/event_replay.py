@@ -27,7 +27,7 @@ from app.db.models import (
 from app.intelligence.event_hypotheses import SCORING_VERSION, build_candidate_clusters
 from app.services.job_outbox import enqueue_event_replay
 
-ENGINE_VERSION = "event-evolution-replay-v1"
+ENGINE_VERSION = "event-evolution-replay-v2-indexed"
 MAX_WINDOW_DAYS = 366
 MAX_INPUTS = 500
 
@@ -118,6 +118,7 @@ def create_event_replay(
         "max_time_gap_hours": round(float(max_time_gap_hours), 4),
         "semantic_model": None,
         "supervised_pair_model": None,
+        "baseline_scope": "overlap_relevant_hypotheses_with_full_membership",
         "deterministic_mode": True,
         "candidate_only": True,
         "human_review_required": True,
@@ -128,13 +129,31 @@ def create_event_replay(
         digest = _canonical_hash(payload)
         frozen.append((report.id, digest, payload))
 
-    # Freeze the current association sets as the comparison baseline. Later human
-    # decisions or new discoveries cannot rewrite what this replay was compared to.
+    # A hypothesis can affect replay comparison only when at least one of its
+    # active associations overlaps a frozen replay input. Freeze every active
+    # membership row for those hypotheses (including out-of-window reports), but
+    # avoid copying unrelated hypotheses from the entire application database.
+    input_report_ids = [item[0] for item in frozen]
+    overlapping_hypothesis_ids = (
+        db.query(EventHypothesisReport.hypothesis_id)
+        .filter(
+            EventHypothesisReport.report_id.in_(input_report_ids),
+            EventHypothesisReport.association_status != "rejected",
+        )
+        .distinct()
+        .all()
+        if input_report_ids else []
+    )
+    relevant_hypothesis_ids = [row[0] for row in overlapping_hypothesis_ids]
     baseline_associations = (
         db.query(EventHypothesisReport)
-        .filter(EventHypothesisReport.association_status != "rejected")
+        .filter(
+            EventHypothesisReport.hypothesis_id.in_(relevant_hypothesis_ids),
+            EventHypothesisReport.association_status != "rejected",
+        )
         .order_by(EventHypothesisReport.hypothesis_id.asc(), EventHypothesisReport.report_id.asc())
         .all()
+        if relevant_hypothesis_ids else []
     )
     baseline_ids: dict[str, list[str]] = {}
     for association in baseline_associations:
@@ -197,18 +216,36 @@ def create_event_replay(
 
 
 def _comparison(
-    report_ids: set[str], hypotheses: list[tuple[EventHypothesis, set[str]]]
+    report_ids: set[str],
+    hypotheses: list[tuple[EventHypothesis, set[str]]],
+    *,
+    report_index: dict[str, set[int]] | None = None,
+    diagnostics: dict | None = None,
 ) -> tuple[str, str | None, float, dict]:
+    if report_index is None:
+        candidate_indexes = range(len(hypotheses))
+    else:
+        candidate_indexes = sorted({
+            index for report_id in report_ids
+            for index in report_index.get(report_id, ())
+        })
     scored = []
-    for hypothesis, existing_ids in hypotheses:
+    for index in candidate_indexes:
+        hypothesis, existing_ids = hypotheses[index]
         intersection = report_ids & existing_ids
         if not intersection:
             continue
         union = report_ids | existing_ids
         jaccard = len(intersection) / len(union) if union else 0.0
         scored.append((jaccard, len(intersection), hypothesis.id, hypothesis, existing_ids))
+    if diagnostics is not None:
+        diagnostics["baseline_candidates_considered"] = len(candidate_indexes)
     if not scored:
-        return "new_candidate", None, 0.0, {"matching_method": "report_id_jaccard", "overlap_count": 0}
+        return "new_candidate", None, 0.0, {
+            "matching_method": "report_id_jaccard",
+            "overlap_count": 0,
+            "baseline_candidates_considered": len(candidate_indexes),
+        }
     scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
     score, overlap, _identity, hypothesis, existing_ids = scored[0]
     if report_ids == existing_ids:
@@ -226,6 +263,7 @@ def _comparison(
         "replay_report_count": len(report_ids),
         "baseline_hypothesis_status": hypothesis.status,
         "baseline_scoring_version": hypothesis.scoring_version,
+        "baseline_candidates_considered": len(candidate_indexes),
     }
 
 
@@ -260,6 +298,7 @@ def execute_event_replay(db: Session, run_id: str) -> dict:
         reports.append(SimpleNamespace(**data))
 
     params = dict(run.parameters or {})
+    clustering_metrics = {}
     clusters = build_candidate_clusters(
         reports,
         minimum_pair_score=float(params["minimum_pair_score"]),
@@ -267,6 +306,7 @@ def execute_event_replay(db: Session, run_id: str) -> dict:
         max_time_gap_hours=float(params["max_time_gap_hours"]),
         semantic_similarities=None,
         use_supervised_model=False,
+        diagnostics=clustering_metrics,
     )
 
     frozen_baseline = (
@@ -296,12 +336,31 @@ def execute_event_replay(db: Session, run_id: str) -> dict:
     if len(frozen_baseline) != int(run.baseline_count or 0) or actual_baseline_manifest != run.baseline_manifest_sha256:
         raise ValueError("replay_baseline_manifest_integrity_failure")
 
+    baseline_report_index: dict[str, set[int]] = {}
+    for index, (_hypothesis, baseline_report_ids) in enumerate(comparison_index):
+        for report_id in baseline_report_ids:
+            baseline_report_index.setdefault(report_id, set()).add(index)
+
     # Delete any partial previous result set before rebuilding deterministically.
     db.query(EventReplayResult).filter_by(run_id=run.id).delete(synchronize_session=False)
     counts = {kind: 0 for kind in ("new_candidate", "unchanged", "expanded", "contracted", "diverged")}
+    comparison_metrics = {
+        "baseline_hypotheses_frozen": len(comparison_index),
+        "naive_baseline_comparisons": len(clusters) * len(comparison_index),
+        "indexed_baseline_comparisons": 0,
+    }
     for ordinal, cluster in enumerate(clusters, start=1):
         report_ids = set(cluster["report_ids"])
-        kind, matched_id, overlap_score, compare_detail = _comparison(report_ids, comparison_index)
+        comparison_diagnostics = {}
+        kind, matched_id, overlap_score, compare_detail = _comparison(
+            report_ids,
+            comparison_index,
+            report_index=baseline_report_index,
+            diagnostics=comparison_diagnostics,
+        )
+        comparison_metrics["indexed_baseline_comparisons"] += comparison_diagnostics.get(
+            "baseline_candidates_considered", 0
+        )
         counts[kind] += 1
         identity = {
             "report_ids": sorted(report_ids),
@@ -354,6 +413,15 @@ def execute_event_replay(db: Session, run_id: str) -> dict:
         "input_manifest_sha256": run.input_manifest_sha256,
         "baseline_manifest_sha256": run.baseline_manifest_sha256,
         "baseline_count": run.baseline_count,
+        "clustering_metrics": clustering_metrics,
+        "comparison_metrics": {
+            **comparison_metrics,
+            "baseline_comparisons_pruned": max(
+                0,
+                comparison_metrics["naive_baseline_comparisons"]
+                - comparison_metrics["indexed_baseline_comparisons"],
+            ),
+        },
     }
     run.status = "completed"
     run.failure_code = None

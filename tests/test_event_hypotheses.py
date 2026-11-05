@@ -346,3 +346,141 @@ def test_event_discovery_worker_records_completed_run(monkeypatch):
         assert run.completed_at is not None
         assert run.duration_ms is not None
     engine.dispose()
+
+
+def _reference_complete_link_memberships(reports, *, max_distance_km=25.0, max_time_gap_hours=72.0):
+    """Small brute-force oracle retained to prove indexed clustering is semantics-preserving."""
+    from itertools import combinations
+    from statistics import mean
+
+    from app.intelligence.event_hypotheses import (
+        _eligible,
+        _event_time,
+        _pair_result,
+        _source_origin,
+    )
+
+    unique = {str(item.id): item for item in reports if str(getattr(item, "id", "") or "") and _eligible(item)}
+    ordered = sorted(unique.values(), key=lambda item: (_event_time(item), str(item.id)))
+    clusters = []
+    cache = {}
+
+    def pair(first, second):
+        key = tuple(sorted((str(first.id), str(second.id))))
+        if key not in cache:
+            cache[key] = _pair_result(
+                first, second,
+                minimum_pair_score=0.62,
+                max_distance_km=max_distance_km,
+                max_time_gap_hours=max_time_gap_hours,
+                use_supervised_model=False,
+            )
+        return cache[key]
+
+    for report in ordered:
+        compatible = []
+        for cluster in clusters:
+            scores = [pair(report, member) for member in cluster]
+            if scores and all(item is not None for item in scores):
+                compatible.append((
+                    min(item["score"] for item in scores),
+                    mean(item["score"] for item in scores),
+                    len(cluster),
+                    cluster,
+                ))
+        if compatible:
+            compatible.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+            compatible[0][3].append(report)
+        else:
+            clusters.append([report])
+
+    output = []
+    for cluster in clusters:
+        if len(cluster) < 2 or len({_source_origin(item) for item in cluster}) < 2:
+            continue
+        pairwise = [
+            {
+                **pair(first, second),
+                "report_a": str(first.id),
+                "report_b": str(second.id),
+            }
+            for first, second in combinations(cluster, 2)
+        ]
+        if all(item["score"] is not None for item in pairwise):
+            ordered_cluster = sorted(cluster, key=lambda item: (_event_time(item), str(item.id)))
+            output.append({
+                "report_ids": [str(item.id) for item in ordered_cluster],
+                "pairwise": pairwise,
+            })
+    output.sort(key=lambda item: (
+        max(_event_time(unique[report_id]) for report_id in item["report_ids"]),
+        item["report_ids"][0],
+    ), reverse=True)
+    return output
+
+
+def test_indexed_complete_link_matches_brute_force_and_prunes_unrelated_clusters():
+    from datetime import UTC, datetime, timedelta
+
+    from app.intelligence.event_hypotheses import build_candidate_clusters
+
+    reports = []
+    origin_types = ("usgs", "gdacs", "imd")
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    # Geographically separated groups deliberately create many clusters that
+    # the old global scan visited but that cannot match the current report.
+    for group in range(12):
+        latitude = -30.0 + (group % 6) * 12.0
+        longitude = -150.0 + (group // 6) * 300.0 + (group % 6) * 3.0
+        for index in range(4):
+            reports.append(_report(
+                f"g{group:02d}-r{index:02d}",
+                origin_types[index % len(origin_types)],
+                source_name=f"origin-{index % len(origin_types)}",
+                longitude=longitude + (index * 0.0005),
+                observed_at=start + timedelta(minutes=index * 5),
+            ))
+            reports[-1].latitude = latitude + index * 0.0005
+
+    expected = _reference_complete_link_memberships(reports)
+    diagnostics = {}
+    actual = build_candidate_clusters(
+        reports, use_supervised_model=False, diagnostics=diagnostics,
+    )
+
+    assert [item["report_ids"] for item in actual] == [item["report_ids"] for item in expected]
+    for actual_cluster, expected_cluster in zip(actual, expected, strict=True):
+        actual_pairs = [
+            (item["report_a"], item["report_b"], item["score"])
+            for item in actual_cluster["pairwise"]
+        ]
+        expected_pairs = [
+            (item["report_a"], item["report_b"], item["score"])
+            for item in expected_cluster["pairwise"]
+        ]
+        assert actual_pairs == expected_pairs
+    assert len(actual) == 12
+    assert diagnostics["algorithm"] == "indexed_greedy_complete_link_v1"
+    assert diagnostics["cluster_candidates_pruned"] > 0
+    assert diagnostics["indexed_cluster_candidates"] < diagnostics["naive_cluster_candidates"]
+    assert diagnostics["naive_candidate_reduction_pct"] > 50.0
+    assert diagnostics["pair_score_evaluations"] <= diagnostics["pair_requests"]
+
+
+def test_spatial_index_cover_handles_dateline_and_polar_neighbours():
+    from app.intelligence.analyzer import haversine_km
+    from app.intelligence.event_hypotheses import _spatial_index_cells
+
+    cases = [
+        ((0.0, 179.9), (0.0, -179.9), 25.0),
+        ((89.9, 10.0), (89.9, 145.0), 25.0),
+        ((-84.0, -179.8), (-84.0, 179.8), 25.0),
+        ((35.0, 179.0), (35.1, -179.5), 150.0),
+    ]
+    for center, neighbour, radius_km in cases:
+        assert haversine_km(*center, *neighbour) <= radius_km
+        latitude_cells, longitude_cells = _spatial_index_cells(*center, radius_km)
+        latitude_cell = int(neighbour[0] + 90.0)
+        longitude_cell = int((neighbour[1] + 180.0) % 360.0)
+        assert latitude_cell in latitude_cells
+        assert longitude_cell in longitude_cells

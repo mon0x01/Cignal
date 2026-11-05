@@ -27,7 +27,7 @@ AI outputs are advisory triage hints. Cignal does not autonomously declare emerg
 - Historical CSV import with provenance labels.
 - Optional multilingual sentence-transformer NLP and optional generic MobileNet image context model.
 - Cross-source event hypotheses with complete-link matching, optional multilingual embeddings, event-state history and source operation/review profiles.
-- Event Evolution & Historical Replay: frozen report-input manifests, pinned deterministic scoring versions, replay-to-current hypothesis comparisons, and candidate-only results through the durable job outbox.
+- Event Evolution & Historical Replay: frozen report-input manifests, pinned deterministic scoring versions, indexed complete-link discovery, overlap-scoped replay baselines with full membership retention, and candidate-only results through the durable job outbox.
 - Offline, event-group-disjoint training/evaluation workflow for a supervised event-pair ranker, benchmarked against Cignal's existing heuristic scorer.
 - In-app notifications, optional SMTP email and optional Web Push.
 - PWA manifest/service worker and a limited anonymous-report offline draft bridge.
@@ -40,7 +40,7 @@ This ZIP is the **functional first release foundation**, not a claim that every 
 
 Several real integrations need user-provided credentials or endpoint details. Cignal reports source provenance and does not silently substitute simulated records for missing live data.
 
-Event Intelligence v2's supervised model is an extensible training pipeline, not a claim of model superiority. No real-world labelled event-pair corpus is bundled; synthetic fixtures are software smoke tests only. Optional multilingual embeddings are disabled by default and load only from locally staged model files. See `docs/EVENT_INTELLIGENCE_V2.md` and `docs/INCIDENT_OPERATIONS_V1.md`.
+Event Intelligence v2's supervised model is an extensible training pipeline, not a claim of model superiority. No real-world labelled event-pair corpus is bundled; synthetic fixtures are software smoke tests only. Optional multilingual embeddings are disabled by default and load only from locally staged model files. See `docs/EVENT_INTELLIGENCE_V2.md`, `docs/EVENT_EVOLUTION_SCALE_V1.md` and `docs/INCIDENT_OPERATIONS_V1.md`.
 
 ## Requirements
 

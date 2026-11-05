@@ -180,3 +180,85 @@ def test_replay_request_rejects_invalid_time_window(db_factory):
             create_event_replay(
                 db, requested_by=None, start_at=now, end_at=now - timedelta(seconds=1)
             )
+
+
+def test_replay_baseline_freezes_only_overlapping_hypotheses_with_full_membership(db_factory):
+    now = datetime.now(UTC)
+    with db_factory() as db:
+        in_window_a = _report("usgs", now - timedelta(hours=2))
+        in_window_b = _report("gdacs", now - timedelta(hours=1), offset=0.001)
+        outside_window = _report("imd", now - timedelta(days=5), offset=0.002)
+        unrelated = _report("rss", now - timedelta(days=6), offset=0.003)
+        db.add_all([in_window_a, in_window_b, outside_window, unrelated])
+        db.flush()
+
+        hypothesis = EventHypothesis(
+            id=str(uuid4()), event_key=uuid4().hex, anchor_report_id=in_window_a.id,
+            title="Relevant flood candidate", summary="Candidate", disaster_type="flood",
+            status="candidate", centroid_latitude=23.0225, centroid_longitude=72.5714,
+            first_observed_at=now - timedelta(days=5), last_observed_at=now - timedelta(hours=1),
+            report_count=3, distinct_source_count=3, match_score=0.9,
+            scoring_version="legacy-v1", explanation={},
+        )
+        irrelevant_hypothesis = EventHypothesis(
+            id=str(uuid4()), event_key=uuid4().hex, anchor_report_id=unrelated.id,
+            title="Unrelated candidate", summary="Candidate", disaster_type="flood",
+            status="candidate", centroid_latitude=23.0225, centroid_longitude=72.5714,
+            first_observed_at=now - timedelta(hours=3), last_observed_at=now - timedelta(hours=3),
+            report_count=1, distinct_source_count=1, match_score=0.0,
+            scoring_version="legacy-v1", explanation={},
+        )
+        db.add_all([hypothesis, irrelevant_hypothesis])
+        for report in (in_window_a, in_window_b, outside_window):
+            db.add(EventHypothesisReport(
+                id=str(uuid4()), hypothesis_id=hypothesis.id, report_id=report.id,
+                association_status="confirmed", relationship_type="supports",
+                pair_score=0.9, component_scores={}, reasons=[],
+            ))
+        db.add(EventHypothesisReport(
+            id=str(uuid4()), hypothesis_id=irrelevant_hypothesis.id, report_id=unrelated.id,
+            association_status="confirmed", relationship_type="supports",
+            pair_score=0.9, component_scores={}, reasons=[],
+        ))
+        db.commit()
+
+        run, _job = create_event_replay(
+            db, requested_by=None,
+            start_at=now - timedelta(days=1),
+            end_at=now + timedelta(minutes=1),
+        )
+        db.commit()
+
+        baselines = db.query(EventReplayBaseline).filter_by(run_id=run.id).all()
+        assert run.baseline_count == 1
+        assert [row.hypothesis_id for row in baselines] == [hypothesis.id]
+        assert set(baselines[0].report_ids) == {
+            in_window_a.id, in_window_b.id, outside_window.id,
+        }
+        assert run.parameters["baseline_scope"] == "overlap_relevant_hypotheses_with_full_membership"
+
+
+def test_indexed_baseline_comparison_matches_full_scan():
+    from types import SimpleNamespace
+
+    from app.services.event_replay import _comparison
+
+    baselines = [
+        (SimpleNamespace(id="hyp-a", status="candidate", scoring_version="v1"), {"r1", "r2"}),
+        (SimpleNamespace(id="hyp-b", status="investigating", scoring_version="v2"), {"r2", "r3", "r4"}),
+        (SimpleNamespace(id="hyp-c", status="candidate", scoring_version="v1"), {"unrelated"}),
+    ]
+    report_index = {"r1": {0}, "r2": {0, 1}, "r3": {1}, "r4": {1}, "unrelated": {2}}
+
+    for candidate in ({"r1", "r2"}, {"r2", "r3"}, {"r8"}):
+        full_scan = _comparison(candidate, baselines)
+        diagnostics = {}
+        indexed = _comparison(candidate, baselines, report_index=report_index, diagnostics=diagnostics)
+        assert indexed[:3] == full_scan[:3]
+        indexed_detail = dict(indexed[3])
+        full_detail = dict(full_scan[3])
+        indexed_detail.pop("baseline_candidates_considered", None)
+        full_detail.pop("baseline_candidates_considered", None)
+        assert indexed_detail == full_detail
+        assert diagnostics["baseline_candidates_considered"] <= len(baselines)
+    assert _comparison({"r8"}, baselines, report_index=report_index)[0] == "new_candidate"

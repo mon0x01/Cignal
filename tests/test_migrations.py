@@ -36,7 +36,7 @@ def test_alembic_migrations_create_schema_and_encrypted_mfa_columns():
         version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
     run_columns = {column["name"]: column for column in inspector.get_columns("integration_runs")}
     assert {"source_type", "status", "records_fetched", "records_inserted", "records_duplicate", "records_rejected", "retryable"}.issubset(run_columns)
-    assert version == "0021_job_execution_reliability"
+    assert version == "0022_event_evolution_scale"
     assert len(version) <= 32
     assert "source_observed_at" in report_columns
     assert {"analysis_revision", "analyzed_revision"}.issubset(report_columns)
@@ -680,4 +680,31 @@ def test_0021_migration_adds_execution_leases_and_preserves_enqueued_jobs_idempo
         ).one()
         assert publishing.status == "publishing"
         assert publishing.last_rq_job_id == "legacy-publishing-job"
+    engine.dispose()
+
+
+
+def test_0022_migration_adds_report_hypothesis_lookup_index_idempotently():
+    import importlib
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import create_engine, inspect
+
+    engine = create_engine("sqlite:///:memory:")
+    migration = importlib.import_module("migrations.versions.0022_event_evolution_scale")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE event_hypothesis_reports ("
+            "id VARCHAR(36) PRIMARY KEY, report_id VARCHAR(36), "
+            "association_status VARCHAR(16), hypothesis_id VARCHAR(36))"
+        )
+        context = MigrationContext.configure(connection)
+        with Operations.context(context):
+            migration.upgrade()
+            migration.upgrade()
+        indexes = {item["name"]: item for item in inspect(connection).get_indexes("event_hypothesis_reports")}
+        assert indexes["ix_event_hypothesis_reports_report_status_hypothesis"]["column_names"] == [
+            "report_id", "association_status", "hypothesis_id",
+        ]
     engine.dispose()
