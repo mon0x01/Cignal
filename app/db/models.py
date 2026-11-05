@@ -808,3 +808,110 @@ class ResearchDatasetVersionItem(Base):
         Index("ix_research_dataset_version_items_version_id", "version_id"),
         Index("ix_research_dataset_version_items_group", "version_id", "split_group"),
     )
+
+
+class EventReplayRun(Base):
+    """Reproducible, non-mutating historical event-correlation replay."""
+    __tablename__ = "event_replay_runs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    requested_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued", index=True)
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    parameters: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    engine_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    scoring_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    input_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    input_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    baseline_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    baseline_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    summary: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    failure_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    __table_args__ = (
+        CheckConstraint("status IN ('queued','running','completed','failed')", name="ck_event_replay_runs_status"),
+        CheckConstraint("input_count >= 0 AND baseline_count >= 0 AND result_count >= 0", name="ck_event_replay_runs_counts"),
+        CheckConstraint("start_at < end_at", name="ck_event_replay_runs_window"),
+        Index("ix_event_replay_runs_status_created", "status", "created_at"),
+    )
+
+
+class EventReplayInput(Base):
+    """Frozen minimal report fields required to reproduce one replay input."""
+    __tablename__ = "event_replay_inputs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("event_replay_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    report_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    input_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_data: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    __table_args__ = (
+        UniqueConstraint("run_id", "report_id", name="uq_event_replay_input_report"),
+        Index("ix_event_replay_inputs_run_id", "run_id"),
+    )
+
+
+class EventReplayBaseline(Base):
+    """Frozen event-hypothesis membership used as the replay comparison baseline."""
+    __tablename__ = "event_replay_baselines"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("event_replay_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    hypothesis_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    hypothesis_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    scoring_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    report_ids: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    baseline_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    __table_args__ = (
+        UniqueConstraint("run_id", "hypothesis_id", name="uq_event_replay_baseline_hypothesis"),
+        Index("ix_event_replay_baselines_run_id", "run_id"),
+    )
+
+
+class EventReplayResult(Base):
+    """One candidate cluster produced by a replay; never an operational incident."""
+    __tablename__ = "event_replay_results"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("event_replay_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    candidate_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    report_ids: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    disaster_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    centroid_latitude: Mapped[float] = mapped_column(Float, nullable=False)
+    centroid_longitude: Mapped[float] = mapped_column(Float, nullable=False)
+    first_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    report_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    distinct_source_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    match_score: Mapped[float] = mapped_column(Float, nullable=False)
+    minimum_pair_score: Mapped[float] = mapped_column(Float, nullable=False)
+    comparison_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    # Preserve the matched identity even if the live hypothesis is later removed.
+    matched_hypothesis_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    overlap_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    explanation: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    __table_args__ = (
+        UniqueConstraint("run_id", "candidate_key", name="uq_event_replay_result_candidate"),
+        UniqueConstraint("run_id", "ordinal", name="uq_event_replay_result_ordinal"),
+        CheckConstraint("report_count >= 2 AND distinct_source_count >= 2", name="ck_event_replay_result_counts"),
+        CheckConstraint("match_score >= 0 AND match_score <= 1", name="ck_event_replay_result_score"),
+        CheckConstraint("overlap_score >= 0 AND overlap_score <= 1", name="ck_event_replay_result_overlap"),
+        CheckConstraint(
+            "comparison_kind IN ('new_candidate','unchanged','expanded','contracted','diverged')",
+            name="ck_event_replay_result_comparison",
+        ),
+        Index("ix_event_replay_results_run_ordinal", "run_id", "ordinal"),
+    )

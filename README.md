@@ -27,6 +27,7 @@ AI outputs are advisory triage hints. Cignal does not autonomously declare emerg
 - Historical CSV import with provenance labels.
 - Optional multilingual sentence-transformer NLP and optional generic MobileNet image context model.
 - Cross-source event hypotheses with complete-link matching, optional multilingual embeddings, event-state history and source operation/review profiles.
+- Event Evolution & Historical Replay: frozen report-input manifests, pinned deterministic scoring versions, replay-to-current hypothesis comparisons, and candidate-only results through the durable job outbox.
 - Offline, event-group-disjoint training/evaluation workflow for a supervised event-pair ranker, benchmarked against Cignal's existing heuristic scorer.
 - In-app notifications, optional SMTP email and optional Web Push.
 - PWA manifest/service worker and a limited anonymous-report offline draft bridge.

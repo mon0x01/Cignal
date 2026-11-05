@@ -955,4 +955,7 @@ def test_research_dataset_api_routes_are_registered():
         "/api/research/datasets/{dataset_id}/pair-labels/{label_id}/review",
         "/api/research/datasets/{dataset_id}/versions",
         "/api/research/datasets/{dataset_id}/versions/{version_id}/export",
+        "/api/intelligence/event-replays",
+        "/api/intelligence/event-replays/{run_id}",
+        "/api/intelligence/event-replays/{run_id}/results",
     }.issubset(paths)

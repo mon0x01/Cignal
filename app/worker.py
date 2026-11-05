@@ -23,6 +23,7 @@ from app.db.models import (
     AcquisitionBackfillRun,
     AcquisitionObservation,
     EventDiscoveryRun,
+    EventReplayRun,
     Evidence,
     IntegrationRun,
     Notification,
@@ -1192,6 +1193,53 @@ def mine_pair_candidates(run_id: str) -> dict:
             db.commit()
         logger.exception("Pair candidate mining failed: %s", type(exc).__name__)
         raise
+    finally:
+        db.close()
+
+
+def replay_event_history(replay_id: str) -> dict:
+    """Execute a frozen-input event replay; canonical incidents are never mutated."""
+    from app.services.event_replay import execute_event_replay
+
+    db = SessionLocal()
+    started_at = datetime.now(UTC)
+    try:
+        run = db.get(EventReplayRun, replay_id)
+        if run is None:
+            return {"ok": False, "reason": "replay_not_found"}
+        if run.status == "completed":
+            return {"ok": True, "status": "completed", "run_id": replay_id, "idempotent_replay": True}
+        run.status = "running"
+        run.started_at = started_at
+        run.failure_code = None
+        db.commit()
+        result = execute_event_replay(db, replay_id)
+        run = db.get(EventReplayRun, replay_id)
+        if run is None:
+            return {"ok": False, "reason": "replay_not_found"}
+        completed_at = datetime.now(UTC)
+        run.duration_ms = max(0, int((completed_at - started_at).total_seconds() * 1000))
+        db.commit()
+        try:
+            publish_event("event.replay.completed", {"run_id": replay_id, "summary": result})
+        except Exception as exc:
+            # Notification fan-out is not part of the replay result transaction.
+            logger.warning(
+                "Event replay notification failed run=%s error=%s",
+                replay_id, type(exc).__name__,
+            )
+        return result
+    except Exception as exc:
+        db.rollback()
+        run = db.get(EventReplayRun, replay_id)
+        if run is not None:
+            run.status = "failed"
+            run.failure_code = type(exc).__name__[:80]
+            run.completed_at = datetime.now(UTC)
+            run.duration_ms = max(0, int((run.completed_at - started_at).total_seconds() * 1000))
+            db.commit()
+        logger.exception("Event replay failed run=%s error=%s", replay_id, type(exc).__name__)
+        return {"ok": False, "status": "failed", "run_id": replay_id, "failure_code": type(exc).__name__}
     finally:
         db.close()
 

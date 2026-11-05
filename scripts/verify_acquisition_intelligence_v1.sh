@@ -28,8 +28,8 @@ for file in \
   migrations/versions/0015_acq_archive_learning.py migrations/versions/0016_incident_operations.py \
   app/api/incident_operations.py app/api/response_plans.py \
   app/services/response_playbooks.py app/services/response_orchestration.py \
-  migrations/versions/0017_response_plan_orchestration.py migrations/versions/0018_durable_job_outbox.py migrations/versions/0019_continuous_event_discovery.py \
-  app/services/job_outbox.py app/services/event_discovery_schedule.py docs/BACKGROUND_JOB_OUTBOX_V1.md docs/CONTINUOUS_EVENT_DISCOVERY_V1.md tests/test_job_outbox.py tests/test_continuous_event_discovery.py docs/INCIDENT_OPERATIONS_V1.md \
+  migrations/versions/0017_response_plan_orchestration.py migrations/versions/0018_durable_job_outbox.py migrations/versions/0019_continuous_event_discovery.py migrations/versions/0020_event_evolution_replay.py \
+  app/services/job_outbox.py app/services/event_discovery_schedule.py app/services/event_replay.py docs/EVENT_EVOLUTION_REPLAY_V1.md docs/BACKGROUND_JOB_OUTBOX_V1.md docs/CONTINUOUS_EVENT_DISCOVERY_V1.md tests/test_job_outbox.py tests/test_continuous_event_discovery.py tests/test_event_replay.py docs/INCIDENT_OPERATIONS_V1.md \
   docs/INCIDENT_RESPONSE_ORCHESTRATION_V1.md tests/test_response_orchestration.py \
   tests/test_api_workflow.py tests/test_migrations.py \
   scripts/run_historical_backfill.py scripts/smoke_external_sources.py \
@@ -45,6 +45,10 @@ grep -Fq 'validate_external_evaluation_groups' scripts/evaluate_event_pair_model
 grep -Fq 'artifact_sha256' scripts/evaluate_event_pair_model.py || fail "Model artifact fingerprint missing."
 grep -Fq 'schedule_continuous_event_discovery' app/services/event_discovery_schedule.py || fail "Continuous event discovery scheduler missing."
 grep -Fq 'enqueue_event_discovery' app/services/job_outbox.py || fail "Durable event discovery outbox integration missing."
+grep -Fq 'enqueue_event_replay' app/services/job_outbox.py || fail "Durable event replay outbox integration missing."
+grep -Fq 'def replay_event_history' app/worker.py || fail "Event replay worker entry point missing."
+grep -Fq 'baseline_manifest_sha256' app/services/event_replay.py || fail "Frozen replay comparison-baseline integrity missing."
+grep -Fq 'use_supervised_model=False' app/services/event_replay.py || fail "Deterministic replay scoring mode missing."
 grep -Fq 'continuous_event_discovery_enabled' app/core/config.py || fail "Continuous event discovery configuration missing."
 echo "Release files and source contracts: PASS"
 
@@ -73,7 +77,7 @@ compose exec -T --interactive=false api sh -lc '
   passed_line="$(printf "%s\\n" "$test_output" | grep -Eo "[0-9]+ passed" | tail -n1 || true)"
   passed="${passed_line%% *}"
   test -n "$passed" || { echo "Pytest summary missing."; exit 1; }
-  test "$passed" -ge 273 || { echo "Only $passed tests passed; expected at least 273."; exit 1; }
+  test "$passed" -ge 279 || { echo "Only $passed tests passed; expected at least 279."; exit 1; }
   ruff check app tests migrations scripts
   bandit -q -r app -lll
   echo "Ruff: PASS; Bandit high-severity scan: PASS"
@@ -83,7 +87,7 @@ printf '\n========== 5/9 · MIGRATION AND DATABASE SCHEMA =========='
 printf '\n'
 current="$(compose exec -T --interactive=false api alembic current 2>&1)"
 printf '%s\n' "$current"
-grep -Fq '0019_continuous_event_discovery' <<<"$current" || fail "Expected migration 0019_continuous_event_discovery is not current."
+grep -Fq '0020_event_evolution_replay' <<<"$current" || fail "Expected migration 0020_event_evolution_replay is not current."
 compose exec -T --interactive=false api python - <<'PY'
 from sqlalchemy import inspect
 from app.db.session import engine
@@ -96,6 +100,7 @@ required = {
     "event_hypotheses", "event_hypothesis_reports", "event_discovery_runs",
     "incident_actions", "incident_action_events", "incident_response_plans",
     "incident_action_dependencies", "background_job_outbox",
+    "event_replay_runs", "event_replay_inputs", "event_replay_baselines", "event_replay_results",
 }
 actual = set(inspector.get_table_names())
 missing = sorted(required - actual)
@@ -127,6 +132,19 @@ if not {
     "ck_background_job_outbox_timeout",
 }.issubset(job_outbox_checks):
     raise SystemExit("Background-job outbox database check constraints missing")
+replay_unique = {
+    item.get("name") for item in inspector.get_unique_constraints("event_replay_baselines")
+}
+if "uq_event_replay_baseline_hypothesis" not in replay_unique:
+    raise SystemExit("Frozen replay baseline uniqueness constraint missing")
+replay_checks = {
+    item.get("name") for item in inspector.get_check_constraints("event_replay_results")
+}
+if not {
+    "ck_event_replay_result_counts", "ck_event_replay_result_score",
+    "ck_event_replay_result_overlap", "ck_event_replay_result_comparison",
+}.issubset(replay_checks):
+    raise SystemExit("Event replay result check constraints missing")
 for table, unique_name in (
     ("incident_response_plans", "uq_incident_response_plans_idempotency"),
     ("incident_action_dependencies", "uq_incident_action_dependencies_unique"),
@@ -204,13 +222,17 @@ required = {
     ("/api/incidents/{incident_id}/response-plans/{plan_id}/cancel", "POST"),
     ("/api/admin/background-jobs/outbox", "GET"),
     ("/api/admin/background-jobs/outbox/{job_id}/retry", "POST"),
+    ("/api/intelligence/event-replays", "POST"),
+    ("/api/intelligence/event-replays", "GET"),
+    ("/api/intelligence/event-replays/{run_id}", "GET"),
+    ("/api/intelligence/event-replays/{run_id}/results", "GET"),
     ("/api/integrations/health", "GET"),
     ("/api/integrations/schedules", "GET"),
 }
 missing = sorted(required - routes)
 if missing:
     raise SystemExit(f"Missing API routes: {missing}")
-print(f"Acquisition, intelligence, operations, response-orchestration and outbox routes: {len(required)}/{len(required)} present")
+print(f"Acquisition, intelligence, operations, response-orchestration, outbox and replay routes: {len(required)}/{len(required)} present")
 PY
 
 printf '\n========== 7/9 · API, FRONTEND, DATABASE AND REDIS HEALTH =========='
@@ -242,6 +264,6 @@ printf '\n'
 echo "No provider smoke test or live ingestion was triggered by this verifier."
 echo "Run scripts/smoke_external_sources.py for read-only network checks."
 echo "Run scripts/verify_live_acquisition_e2e.py only when ready to write bounded real USGS data."
-printf '\nALL CIGNAL ACQUISITION, INTELLIGENCE, INCIDENT OPERATIONS, RESPONSE ORCHESTRATION AND DURABLE JOB OUTBOX QUALITY GATES PASSED.\n'
-printf 'Migration: 0018_durable_job_outbox\n'
+printf '\nALL CIGNAL ACQUISITION, INTELLIGENCE, INCIDENT OPERATIONS, RESPONSE ORCHESTRATION, DURABLE JOB OUTBOX AND EVENT REPLAY QUALITY GATES PASSED.\n'
+printf 'Migration: 0020_event_evolution_replay\n'
 printf 'No existing database/evidence/Redis/model volumes were reset.\n'

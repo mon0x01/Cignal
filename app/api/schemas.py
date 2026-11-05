@@ -150,6 +150,27 @@ class EventDiscoveryRequest(BaseModel):
     max_distance_km: float = Field(default=25.0, ge=0.1, le=500.0)
 
 
+class EventReplayRequest(BaseModel):
+    start_at: datetime
+    end_at: datetime
+    max_reports: int = Field(default=500, ge=2, le=500)
+    minimum_pair_score: float = Field(default=0.62, ge=0.0, le=1.0)
+    max_distance_km: float = Field(default=25.0, ge=0.1, le=500.0)
+    max_time_gap_hours: float = Field(default=72.0, ge=1.0, le=720.0)
+
+    @model_validator(mode="after")
+    def validate_replay_window(self):
+        from datetime import UTC, timedelta
+
+        start = self.start_at.replace(tzinfo=UTC) if self.start_at.tzinfo is None else self.start_at.astimezone(UTC)
+        end = self.end_at.replace(tzinfo=UTC) if self.end_at.tzinfo is None else self.end_at.astimezone(UTC)
+        if start >= end:
+            raise ValueError("start_at must be earlier than end_at")
+        if end - start > timedelta(days=366):
+            raise ValueError("An event replay is limited to 366 days")
+        return self
+
+
 class EventHypothesisReview(BaseModel):
     status: str = Field(pattern="^(investigating|dismissed)$")
     note: str | None = Field(default=None, max_length=1000)

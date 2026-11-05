@@ -75,6 +75,7 @@ def _pair_result(
     max_distance_km: float,
     max_time_gap_hours: float,
     semantic_similarity: float | None = None,
+    use_supervised_model: bool = True,
 ) -> dict | None:
     first_type = str(getattr(first, "disaster_type", "unknown") or "unknown").lower()
     second_type = str(getattr(second, "disaster_type", "unknown") or "unknown").lower()
@@ -114,9 +115,10 @@ def _pair_result(
         result["semantic_similarity"] = None
         result["text_match_score"] = result["text_similarity"]
 
-    from app.intelligence.event_pair_model import score_event_pair_model
-
-    supervised = score_event_pair_model(first, second)
+    supervised = None
+    if use_supervised_model:
+        from app.intelligence.event_pair_model import score_event_pair_model
+        supervised = score_event_pair_model(first, second)
     if supervised is not None:
         # This uncalibrated classifier output is a candidate-ranking score, not a
         # probability. Keep the rule-based score visible in the explanation.
@@ -145,6 +147,7 @@ def build_candidate_clusters(
     max_distance_km: float = DEFAULT_MAX_DISTANCE_KM,
     max_time_gap_hours: float = DEFAULT_MAX_TIME_GAP_HOURS,
     semantic_similarities: dict[tuple[str, str], float] | None = None,
+    use_supervised_model: bool = True,
 ) -> list[dict]:
     """Build deterministic disjoint complete-link clusters from eligible reports."""
     if not 0.0 <= minimum_pair_score <= 1.0:
@@ -173,6 +176,7 @@ def build_candidate_clusters(
                 max_distance_km=max_distance_km,
                 max_time_gap_hours=max_time_gap_hours,
                 semantic_similarity=(semantic_similarities or {}).get(key),
+                use_supervised_model=use_supervised_model,
             )
         return pair_cache[key]
 

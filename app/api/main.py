@@ -41,6 +41,7 @@ from app.api.schemas import (
     EventHypothesisReview,
     EventPairLabelCreate,
     EventPairLabelReview,
+    EventReplayRequest,
     IncidentActivityCreate,
     IncidentUpdate,
     LoginRequest,
@@ -80,6 +81,8 @@ from app.db.models import (
     EventHypothesisSnapshot,
     EventPairCandidate,
     EventPairLabel,
+    EventReplayResult,
+    EventReplayRun,
     Evidence,
     Incident,
     IncidentActivity,
@@ -107,6 +110,7 @@ from app.services.acquisition_schedule import source_schedule_status
 from app.services.analysis_jobs import advance_report_analysis_revision
 from app.services.audit import record_audit
 from app.services.demo import seed_demo_data
+from app.services.event_replay import create_event_replay
 from app.services.events import enqueue_job, publish_event, redis_client
 from app.services.incident_review import review_report as apply_report_review
 from app.services.integration_runs import connector_health, integration_run_dict
@@ -1559,6 +1563,112 @@ def get_event_hypothesis_timeline(
         }
         for row in rows
     ]
+
+
+def _event_replay_out(run: EventReplayRun) -> dict:
+    return {
+        "id": run.id, "status": run.status,
+        "start_at": run.start_at.isoformat(), "end_at": run.end_at.isoformat(),
+        "parameters": run.parameters or {}, "engine_version": run.engine_version,
+        "scoring_version": run.scoring_version, "input_count": run.input_count,
+        "input_manifest_sha256": run.input_manifest_sha256,
+        "baseline_count": run.baseline_count,
+        "baseline_manifest_sha256": run.baseline_manifest_sha256,
+        "result_count": run.result_count, "summary": run.summary or {},
+        "failure_code": run.failure_code,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "duration_ms": run.duration_ms,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+    }
+
+
+@app.post("/api/intelligence/event-replays", status_code=202)
+def request_event_replay(
+    payload: EventReplayRequest,
+    request: Request,
+    user: User = Depends(require_roles("admin", "analyst")),
+    db: Session = Depends(get_db),
+):
+    """Queue a deterministic replay over frozen report inputs; canonical events stay untouched."""
+    _rate_limit(f"event-replay:{user.id}", 3, 300)
+    try:
+        run, job = create_event_replay(
+            db, requested_by=user.id, start_at=payload.start_at, end_at=payload.end_at,
+            max_reports=payload.max_reports, minimum_pair_score=payload.minimum_pair_score,
+            max_distance_km=payload.max_distance_km,
+            max_time_gap_hours=payload.max_time_gap_hours,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    record_audit(db, "intelligence.event_replay_requested", "event_replay", run.id, user.id)
+    db.commit()
+    return {**_event_replay_out(run), "job_id": job.job_id, "dispatch_status": job.status}
+
+
+@app.get("/api/intelligence/event-replays")
+def list_event_replays(
+    limit: int = Query(default=25, ge=1, le=100),
+    user: User = Depends(require_roles("admin", "analyst")),
+    db: Session = Depends(get_db),
+):
+    rows = db.query(EventReplayRun).order_by(
+        EventReplayRun.created_at.desc(), EventReplayRun.id.desc()
+    ).limit(limit).all()
+    return [_event_replay_out(row) for row in rows]
+
+
+@app.get("/api/intelligence/event-replays/{run_id}")
+def get_event_replay(
+    run_id: str,
+    user: User = Depends(require_roles("admin", "analyst")),
+    db: Session = Depends(get_db),
+):
+    try:
+        normalized_id = str(UUID(run_id))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid event replay ID") from exc
+    run = db.get(EventReplayRun, normalized_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Event replay not found")
+    return _event_replay_out(run)
+
+
+@app.get("/api/intelligence/event-replays/{run_id}/results")
+def list_event_replay_results(
+    run_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0, le=10000),
+    comparison_kind: str | None = Query(
+        default=None, pattern="^(new_candidate|unchanged|expanded|contracted|diverged)$"
+    ),
+    user: User = Depends(require_roles("admin", "analyst")),
+    db: Session = Depends(get_db),
+):
+    try:
+        normalized_id = str(UUID(run_id))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid event replay ID") from exc
+    if db.get(EventReplayRun, normalized_id) is None:
+        raise HTTPException(status_code=404, detail="Event replay not found")
+    query = db.query(EventReplayResult).filter_by(run_id=normalized_id)
+    if comparison_kind:
+        query = query.filter(EventReplayResult.comparison_kind == comparison_kind)
+    rows = query.order_by(EventReplayResult.ordinal.asc()).offset(offset).limit(limit).all()
+    return [{
+        "id": row.id, "ordinal": row.ordinal, "candidate_key": row.candidate_key,
+        "report_ids": row.report_ids, "disaster_type": row.disaster_type,
+        "centroid": {"latitude": row.centroid_latitude, "longitude": row.centroid_longitude},
+        "first_observed_at": row.first_observed_at.isoformat(),
+        "last_observed_at": row.last_observed_at.isoformat(),
+        "report_count": row.report_count, "distinct_source_count": row.distinct_source_count,
+        "match_score": row.match_score,
+        "score_interpretation": "heuristic_match_score_not_probability",
+        "minimum_pair_score": row.minimum_pair_score,
+        "comparison_kind": row.comparison_kind,
+        "matched_hypothesis_id": row.matched_hypothesis_id,
+        "overlap_score": row.overlap_score, "explanation": row.explanation or {},
+    } for row in rows]
 
 
 @app.get("/api/intelligence/semantic-status")

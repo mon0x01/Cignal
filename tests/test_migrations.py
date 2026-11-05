@@ -17,6 +17,7 @@ def test_alembic_migrations_create_schema_and_encrypted_mfa_columns():
         "acquisition_observations", "acquisition_backfill_runs", "acquisition_backfill_items", "pair_candidate_mining_runs",
         "event_pair_candidates", "model_evaluation_runs", "incident_actions", "incident_action_events",
         "incident_response_plans", "incident_action_dependencies", "background_job_outbox",
+        "event_replay_runs", "event_replay_inputs", "event_replay_baselines", "event_replay_results",
     }.issubset(tables)
     user_columns = {column["name"]: column for column in inspector.get_columns("users")}
     report_columns = {column["name"]: column for column in inspector.get_columns("reports")}
@@ -34,7 +35,7 @@ def test_alembic_migrations_create_schema_and_encrypted_mfa_columns():
         version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
     run_columns = {column["name"]: column for column in inspector.get_columns("integration_runs")}
     assert {"source_type", "status", "records_fetched", "records_inserted", "records_duplicate", "records_rejected", "retryable"}.issubset(run_columns)
-    assert version == "0019_continuous_event_discovery"
+    assert version == "0020_event_evolution_replay"
     assert len(version) <= 32
     assert "source_observed_at" in report_columns
     assert {"analysis_revision", "analyzed_revision"}.issubset(report_columns)
@@ -565,4 +566,50 @@ def test_0018_migration_creates_durable_job_outbox_idempotently():
         assert connection.execute(text(
             "SELECT job_id, status FROM background_job_outbox WHERE id='outbox-1'"
         )).one() == ("cignal-report-analysis-r1", "pending")
+    engine.dispose()
+
+
+
+def test_0020_event_evolution_replay_migration_is_idempotent_and_preserves_parent_schema():
+    import importlib
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import create_engine, inspect
+
+    from app.db.models import Base
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    migration = importlib.import_module("migrations.versions.0020_event_evolution_replay")
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP TABLE event_replay_results")
+        connection.exec_driver_sql("DROP TABLE event_replay_baselines")
+        connection.exec_driver_sql("DROP TABLE event_replay_inputs")
+        connection.exec_driver_sql("DROP TABLE event_replay_runs")
+        context = MigrationContext.configure(connection)
+        with Operations.context(context):
+            migration.upgrade()
+            migration.upgrade()
+        inspector = inspect(connection)
+        assert {
+            "event_replay_runs", "event_replay_inputs",
+            "event_replay_baselines", "event_replay_results",
+        }.issubset(set(inspector.get_table_names()))
+        run_columns = {item["name"] for item in inspector.get_columns("event_replay_runs")}
+        assert {
+            "input_manifest_sha256", "baseline_count", "baseline_manifest_sha256",
+            "engine_version", "scoring_version",
+        }.issubset(run_columns)
+        baseline_unique = {
+            item.get("name") for item in inspector.get_unique_constraints("event_replay_baselines")
+        }
+        assert "uq_event_replay_baseline_hypothesis" in baseline_unique
+        result_checks = {
+            item.get("name") for item in inspector.get_check_constraints("event_replay_results")
+        }
+        assert {
+            "ck_event_replay_result_counts", "ck_event_replay_result_score",
+            "ck_event_replay_result_overlap", "ck_event_replay_result_comparison",
+        }.issubset(result_checks)
     engine.dispose()

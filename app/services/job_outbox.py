@@ -18,7 +18,11 @@ from app.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
 
-_ALLOWED_FUNCTIONS = {"app.worker.process_report", "app.worker.discover_event_hypotheses"}
+_ALLOWED_FUNCTIONS = {
+    "app.worker.process_report",
+    "app.worker.discover_event_hypotheses",
+    "app.worker.replay_event_history",
+}
 _ACTIVE_RQ_STATES = {"queued", "started", "deferred", "scheduled", "finished"}
 
 
@@ -97,6 +101,34 @@ def enqueue_event_discovery(
         available_at=utcnow(),
         created_at=utcnow(),
         updated_at=utcnow(),
+    )
+    db.add(row)
+    return row
+
+
+def enqueue_event_replay(db: Session, replay_id: str) -> BackgroundJobOutbox:
+    """Persist a deterministic event-replay request in the caller transaction."""
+    normalized_id = str(replay_id).strip()
+    if not normalized_id or len(normalized_id) > 36:
+        raise ValueError("Invalid event replay identifier")
+    job_id = f"cignal-event-replay-{normalized_id}"
+    args = [normalized_id]
+    existing = next(
+        (item for item in db.new if isinstance(item, BackgroundJobOutbox) and item.job_id == job_id),
+        None,
+    )
+    if existing is None:
+        existing = db.query(BackgroundJobOutbox).filter_by(job_id=job_id).one_or_none()
+    if existing is not None:
+        if existing.function_path != "app.worker.replay_event_history" or existing.task_args != args:
+            raise ValueError("A durable replay job identifier is already bound to different work")
+        return existing
+    row = BackgroundJobOutbox(
+        id=str(uuid4()), job_id=job_id,
+        function_path="app.worker.replay_event_history", task_args=args,
+        queue_name="cignal", job_timeout_seconds=1800, result_ttl_seconds=86400,
+        status="pending", attempts=0, available_at=utcnow(),
+        created_at=utcnow(), updated_at=utcnow(),
     )
     db.add(row)
     return row

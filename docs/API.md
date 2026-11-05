@@ -107,3 +107,14 @@ Dataset registration accepts `coordinate_precision` from 0 to 4 decimals (defaul
 ## Report source provenance
 
 Report response objects include `source_metadata`, a bounded source-catalogue snapshot containing provider/dataset scope, access mode, licence/terms review status, attribution, retention policy, catalogue version and retrieval timestamp. Provider-specific identifiers and metadata are included only where safe and bounded; complete raw provider payloads are not stored. Citizen submissions carry a consent-scope review flag.
+
+## Event evolution and historical replay
+
+All replay endpoints require an administrator or analyst role.
+
+- `POST /api/intelligence/event-replays` accepts `start_at`, `end_at`, and optional bounded scoring parameters. It snapshots eligible report inputs and the current hypothesis-membership baseline, then records a durable outbox dispatch request in the same transaction.
+- `GET /api/intelligence/event-replays` lists recent runs.
+- `GET /api/intelligence/event-replays/{run_id}` returns run status, engine/scoring versions, input and baseline manifest digests, and result summary.
+- `GET /api/intelligence/event-replays/{run_id}/results` returns paginated candidate clusters. Optional `comparison_kind` filters `new_candidate`, `unchanged`, `expanded`, `contracted`, or `diverged` results.
+
+Replay is bounded to 500 eligible analyzed reports and a maximum 366-day observation window. Replay input and comparison-baseline snapshots are immutable and hash-validated before execution. Outputs are candidate-only analytical records; replay never mutates current event hypotheses, incidents, warnings, or response actions.
