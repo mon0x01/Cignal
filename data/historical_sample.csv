@@ -1,0 +1,3 @@
+title,description,disaster_type,urgency,latitude,longitude,location_text,language,source_url
+Illustrative sample: monsoon waterlogging near central market,Synthetic example for interface testing only; this is not an authentic historical municipal record.,flood,moderate,23.0225,72.5714,Ahmedabad Gujarat,en,
+Illustrative sample: tremor report in Kutch,Synthetic example for interface testing only; this is not an authentic historical public bulletin.,earthquake,low,23.2419,69.6669,Bhuj Gujarat,en,

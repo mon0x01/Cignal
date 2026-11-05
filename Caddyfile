@@ -1,0 +1,19 @@
+# Default :80 is intended for a local reverse proxy behind a temporary HTTPS tunnel.
+# For direct Caddy HTTPS, set CIGNAL_DOMAIN to a real DNS name pointing at this server
+# and publish ports 80/443 in docker-compose.yml.
+{$CIGNAL_DOMAIN} {
+    encode zstd gzip
+    handle /api/* {
+        reverse_proxy api:8000
+    }
+    handle {
+        reverse_proxy frontend:8080
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Frame-Options "DENY"
+        -Server
+    }
+}

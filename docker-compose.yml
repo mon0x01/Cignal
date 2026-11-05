@@ -1,0 +1,129 @@
+name: cignal
+services:
+  db:
+    image: postgis/postgis:16-3.5
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cignal}
+      POSTGRES_USER: ${POSTGRES_USER:-cignal}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-cignal-dev-redis-change-me}"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDISCLI_AUTH}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-cignal-dev-redis-change-me}
+    restart: unless-stopped
+
+  api:
+    build: .
+    command: ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-cignal}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-cignal}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-cignal-dev-redis-change-me}@redis:6379/0
+      EVIDENCE_DIR: /data/evidence
+      AI_TEXT_MODEL_PATH: /data/models/disaster-text-v1.joblib
+      AI_VISION_MODEL_PATH: /data/models/disaster-vision-v1.joblib
+      EVENT_PAIR_MODEL_PATH: /data/models/event-pair-v1.joblib
+      AI_MAX_IMAGES_PER_REPORT: ${AI_MAX_IMAGES_PER_REPORT:-8}
+    volumes:
+      - evidence_data:/data/evidence
+      - models_data:/data/models
+      - ./data/training:/data/training:ro
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    ports:
+      - "127.0.0.1:8000:8000"
+    expose: ["8000"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  frontend:
+    build: .
+    command: ["python", "-m", "app.ui.main"]
+    env_file: .env
+    environment:
+      API_INTERNAL_URL: http://api:8000
+      API_PUBLIC_URL: ${API_PUBLIC_URL-}
+    depends_on:
+      api: {condition: service_healthy}
+    ports:
+      - "${UI_BIND_ADDRESS:-127.0.0.1}:${UI_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-cignal}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-cignal}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-cignal-dev-redis-change-me}@redis:6379/0
+      EVIDENCE_DIR: /data/evidence
+      AI_TEXT_MODEL_PATH: /data/models/disaster-text-v1.joblib
+      AI_VISION_MODEL_PATH: /data/models/disaster-vision-v1.joblib
+      EVENT_PAIR_MODEL_PATH: /data/models/event-pair-v1.joblib
+      AI_MAX_IMAGES_PER_REPORT: ${AI_MAX_IMAGES_PER_REPORT:-8}
+    volumes:
+      - evidence_data:/data/evidence
+      - models_data:/data/models
+      - ./data/backups:/data/backups
+    depends_on:
+      api: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+  scheduler:
+    build: .
+    command: ["python", "-m", "app.scheduler"]
+    env_file: .env
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:-cignal-dev-redis-change-me}@redis:6379/0
+    depends_on:
+      redis: {condition: service_healthy}
+      worker: {condition: service_started}
+    restart: unless-stopped
+
+  # Optional reverse proxy. The default profile is private localhost access.
+  # For public exposure, configure a domain or a secure tunnel and HTTPS first.
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["edge"]
+    environment:
+      CIGNAL_DOMAIN: ${CIGNAL_DOMAIN:-:80}
+    ports:
+      - "127.0.0.1:${EDGE_PORT:-8081}:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      frontend: {condition: service_started}
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  evidence_data:
+  models_data:
+  caddy_data:
+  caddy_config:

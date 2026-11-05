@@ -1,0 +1,26 @@
+[project]
+name = "cignal"
+version = "0.1.0"
+description = "Modular multimodal disaster intelligence and decision-support platform"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI requires Depends/Query/File objects in endpoint parameter defaults.
+# B008 is therefore a framework false-positive in this route declaration module.
+"app/api/main.py" = ["B008"]
+"app/api/dependencies.py" = ["B008"]
+"app/api/incident_operations.py" = ["B008"]
+"app/api/response_plans.py" = ["B008"]

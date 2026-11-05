@@ -1,0 +1,4 @@
+# Optional multilingual sentence-transformer NLP extra.
+# Install a CPU-only PyTorch wheel first, then install this file.
+-r requirements.txt
+sentence-transformers>=3.0,<6
